@@ -34,29 +34,81 @@ def get_databricks_users(workspace_url: str, token: str, debug: bool = False, ma
     Returns:
         List of user dictionaries containing user information
     """
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
-    }
-    
+    # If running inside Databricks runtime and token/workspace_url are not provided,
+    # attempt to obtain them from the DBUtils notebook context (best-effort).
     users = []
     start_index = 1
     items_per_page = 100
-    
+
+    # Try to recover workspace_url and token from dbutils when missing
+    if (not workspace_url or not token) and os.environ.get("DATABRICKS_RUNTIME_VERSION"):
+        try:
+            from pyspark.sql import SparkSession as _SparkSession
+            _spark = _SparkSession.builder.getOrCreate()
+            _dbutils = None
+            try:
+                import IPython
+                _dbutils = IPython.get_ipython().user_ns.get('dbutils')
+            except Exception:
+                _dbutils = None
+
+            if _dbutils is None:
+                try:
+                    _dbutils = _spark._jvm.com.databricks.service.DBUtils(_spark._jsc.sc())
+                except Exception:
+                    _dbutils = None
+
+            if _dbutils is not None:
+                try:
+                    # dbutils.notebook().getContext() exposes API URL and token in Databricks notebooks
+                    ctx = _dbutils.notebook().getContext()
+                    api_url = None
+                    api_token = None
+                    try:
+                        api_url = ctx.apiUrl().get()
+                    except Exception:
+                        api_url = None
+                    try:
+                        api_token = ctx.apiToken().get()
+                    except Exception:
+                        api_token = None
+
+                    if api_url and not workspace_url:
+                        workspace_url = api_url.rstrip('/')
+                        if debug:
+                            print(f"In-cluster: inferred workspace_url={workspace_url} from dbutils context")
+                    if api_token and not token:
+                        token = api_token
+                        if debug:
+                            print("In-cluster: obtained API token from dbutils context")
+                except Exception:
+                    # Best-effort; continue with whatever we have
+                    pass
+        except Exception:
+            # If any unexpected error occurs, continue to fallback behavior
+            pass
+
+    # If still missing workspace_url or token, and not in Databricks runtime, the caller
+    # should have raised earlier. Here we try to proceed but will error on requests.
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    headers["Content-Type"] = "application/json"
+
     while True:
+        if not workspace_url:
+            raise RuntimeError("Workspace URL is unknown; cannot call SCIM API.")
+
         url = f"{workspace_url}/api/2.0/preview/scim/v2/Users"
-        params = {
-            "startIndex": start_index,
-            "count": items_per_page
-        }
-        
+        params = {"startIndex": start_index, "count": items_per_page}
+
         try:
             if debug:
                 print(f"Requesting users: startIndex={start_index}, count={items_per_page}...")
 
             response = requests.get(url, headers=headers, params=params, timeout=30)
             response.raise_for_status()
-            
+
             data = response.json()
             resources = data.get("Resources", [])
             total_results = data.get("totalResults", 0)
@@ -66,7 +118,6 @@ def get_databricks_users(workspace_url: str, token: str, debug: bool = False, ma
                     print("No more users returned by API.")
                 break
 
-            # Append resources one by one so we can stream progress and stop early if requested
             for r in resources:
                 users.append(r)
                 if debug:
@@ -79,17 +130,14 @@ def get_databricks_users(workspace_url: str, token: str, debug: bool = False, ma
                         print(f"Reached max_users={max_users}; stopping early.")
                     break
 
-            # If we reached max_users, break outer loop
             if max_users and len(users) >= max_users:
                 break
 
-            # Check if there are more pages
             if total_results and (start_index + items_per_page) > total_results:
                 if debug:
                     print(f"Fetched all reported users ({len(users)}/{total_results}).")
                 break
 
-            # Brief progress feedback when debug is enabled
             if debug and total_results:
                 print(f"Progress: {len(users)}/{total_results} users retrieved so far...")
 
@@ -97,7 +145,7 @@ def get_databricks_users(workspace_url: str, token: str, debug: bool = False, ma
         except Exception as e:
             print(f"Error fetching users: {str(e)}")
             break
-    
+
     return users
 
 
@@ -211,23 +259,132 @@ def process_user_directory(user_data: str) -> List[Dict]:
                     else:
                         worker_dbutils = None
             
-            if worker_dbutils is None:
-                raise Exception("dbutils not available on worker node")
-            
-            # List all items in the home directory
-            items = list_directory_recursive(worker_dbutils, home_path, user_name)
-            
+            # If dbutils is available, try to use it first
+            items = None
+            if worker_dbutils is not None:
+                try:
+                    items = list_directory_recursive(worker_dbutils, home_path, user_name)
+                except Exception as e_list:
+                    # proceed to fallbacks
+                    items = None
+
+            # Fallback 1: try /dbfs mount using os.walk (works on Databricks executors)
+            if items is None:
+                try:
+                    dbfs_path = f"/dbfs{home_path}" if home_path.startswith("/") else f"/dbfs/{home_path}"
+                    if os.path.exists(dbfs_path):
+                        items = []
+                        for root, dirs, files in os.walk(dbfs_path):
+                            # files
+                            for fname in files:
+                                full = os.path.join(root, fname)
+                                try:
+                                    stat = os.stat(full)
+                                    rel_path = full.replace('/dbfs', '')
+                                    items.append({
+                                        "user_name": user_name,
+                                        "path": rel_path,
+                                        "name": os.path.basename(full),
+                                        "size": stat.st_size,
+                                        "is_directory": False,
+                                        "modification_time": str(int(stat.st_mtime * 1000)),
+                                        "error": None
+                                    })
+                                except Exception as _e:
+                                    items.append({
+                                        "user_name": user_name,
+                                        "path": full,
+                                        "name": os.path.basename(full),
+                                        "size": None,
+                                        "is_directory": False,
+                                        "modification_time": None,
+                                        "error": str(_e)
+                                    })
+                            # directories
+                            for dname in dirs:
+                                full = os.path.join(root, dname)
+                                try:
+                                    stat = os.stat(full)
+                                    rel_path = full.replace('/dbfs', '')
+                                    items.append({
+                                        "user_name": user_name,
+                                        "path": rel_path,
+                                        "name": dname,
+                                        "size": None,
+                                        "is_directory": True,
+                                        "modification_time": str(int(stat.st_mtime * 1000)),
+                                        "error": None
+                                    })
+                                except Exception as _e:
+                                    items.append({
+                                        "user_name": user_name,
+                                        "path": full,
+                                        "name": dname,
+                                        "size": None,
+                                        "is_directory": True,
+                                        "modification_time": None,
+                                        "error": str(_e)
+                                    })
+                    else:
+                        items = None
+                except Exception:
+                    items = None
+
+            # Fallback 2: try Hadoop FileSystem via Spark JVM
+            if items is None:
+                try:
+                    # Use the local_spark (created above) to access Hadoop FS
+                    fs = local_spark._jvm.org.apache.hadoop.fs.FileSystem.get(local_spark._jsc.hadoopConfiguration())
+                    Path = local_spark._jvm.org.apache.hadoop.fs.Path
+                    jpath = Path(home_path)
+                    statuses = fs.listStatus(jpath)
+                    items = []
+                    for s in list(statuses):
+                        try:
+                            p = s.getPath()
+                            items.append({
+                                "user_name": user_name,
+                                "path": p.toString(),
+                                "name": p.getName(),
+                                "size": int(s.getLen()),
+                                "is_directory": bool(s.isDirectory()),
+                                "modification_time": str(int(s.getModificationTime())),
+                                "error": None
+                            })
+                        except Exception as _e:
+                            items.append({
+                                "user_name": user_name,
+                                "path": home_path,
+                                "name": os.path.basename(home_path.rstrip('/')), 
+                                "size": None,
+                                "is_directory": None,
+                                "modification_time": None,
+                                "error": str(_e)
+                            })
+                except Exception as e_jvm:
+                    # Give up and return an informative error
+                    return [{
+                        "user_name": user_name,
+                        "user_id": user_id,
+                        "user_display_name": user_display_name,
+                        "user_email": user_email,
+                        "path": home_path,
+                        "name": "home",
+                        "size": None,
+                        "is_directory": None,
+                        "modification_time": None,
+                        "error": f"dbutils not available: {str(e_jvm)}"
+                    }]
+
             # Add user metadata to each item
             for item in items:
                 item["user_id"] = user_id
                 item["user_display_name"] = user_display_name
                 item["user_email"] = user_email
-                
-                # Ensure all fields are present
-                for field in ["error"]:
-                    if field not in item:
-                        item[field] = None
-            
+                # Ensure error field exists
+                if "error" not in item:
+                    item["error"] = None
+
             return items
             
         except Exception as e:
@@ -258,6 +415,183 @@ def process_user_directory(user_data: str) -> List[Dict]:
             "modification_time": None,
             "error": f"Processing error: {str(e)}"
         }]
+
+
+    def driver_list_user(driver_dbutils, user_info: Dict, max_depth: int = 10) -> List[Dict]:
+        """
+        Run on the driver: use `dbutils` to list a user's home directory recursively.
+        Returns a list of item dicts with the same shape as worker results.
+        """
+        try:
+            user_name = user_info.get("userName", "unknown")
+            user_id = user_info.get("id", "")
+            user_display_name = user_info.get("displayName", "")
+            user_email = user_info.get("userName", "")
+
+            home_path = f"/Users/{user_name}"
+
+            items = list_directory_recursive(driver_dbutils, home_path, user_name, max_depth=max_depth)
+
+            # Attach user metadata
+            for item in items:
+                item["user_id"] = user_id
+                item["user_display_name"] = user_display_name
+                item["user_email"] = user_email
+                if "error" not in item:
+                    item["error"] = None
+
+            return items
+        except Exception as e:
+            return [{
+                "user_name": user_info.get("userName", "unknown"),
+                "user_id": user_info.get("id", None),
+                "user_display_name": user_info.get("displayName", None),
+                "user_email": user_info.get("userName", None),
+                "path": f"/Users/{user_info.get('userName','unknown')}",
+                "name": "home",
+                "size": None,
+                "is_directory": None,
+                "modification_time": None,
+                "error": f"Driver listing error: {str(e)}"
+            }]
+
+
+    def driver_enumerate_frontier(driver_dbutils, user_info: Dict) -> List[Dict]:
+        """
+        On the driver, enumerate top-level entries under a user's home directory and
+        return a list of "tasks" — dicts containing user_info and a start_path for workers.
+        If the home directory is empty, returns a single task with the home path.
+        """
+        tasks = []
+        try:
+            user_name = user_info.get("userName", "unknown")
+            home_path = f"/Users/{user_name}"
+            try:
+                entries = driver_dbutils.fs.ls(home_path)
+            except Exception:
+                # If listing fails, return a single task to let the worker try alternative methods
+                return [{"user_info": user_info, "start_path": home_path}]
+
+            if not entries:
+                return [{"user_info": user_info, "start_path": home_path}]
+
+            for e in entries:
+                p = e.path.rstrip('/')
+                tasks.append({"user_info": user_info, "start_path": p})
+
+            return tasks
+        except Exception:
+            # On any error, return a conservative single task
+            return [{"user_info": user_info, "start_path": f"/Users/{user_info.get('userName','unknown')}"}]
+
+
+    def worker_traverse_start(task_json: str) -> List[Dict]:
+        """
+        Worker-side traverser: given a JSON string with keys `user_info` and `start_path`,
+        traverse the subtree rooted at start_path using the `/dbfs` mount and return item dicts.
+        This avoids calling `dbutils` on workers.
+        """
+        try:
+            data = json.loads(task_json)
+            user_info = data.get("user_info", {})
+            start_path = data.get("start_path", "")
+            user_name = user_info.get("userName", "unknown")
+
+            # Convert to local /dbfs path
+            if start_path.startswith("/dbfs"):
+                dbfs_path = start_path
+            elif start_path.startswith('/'):
+                dbfs_path = f"/dbfs{start_path}"
+            else:
+                dbfs_path = f"/dbfs/{start_path}"
+
+            # Log start of work for progress visibility (executor logs)
+            try:
+                print(f"Worker starting traversal for start_path={start_path} (dbfs_path={dbfs_path}) user={user_name}")
+            except Exception:
+                pass
+
+            items = []
+            # Walk the filesystem starting at dbfs_path
+            for root, dirs, files in os.walk(dbfs_path):
+                for fname in files:
+                    full = os.path.join(root, fname)
+                    try:
+                        stat = os.stat(full)
+                        rel_path = full.replace('/dbfs', '')
+                        items.append({
+                            "user_name": user_name,
+                            "path": rel_path,
+                            "name": os.path.basename(full),
+                            "size": stat.st_size,
+                            "is_directory": False,
+                            "modification_time": str(int(stat.st_mtime * 1000)),
+                            "error": None,
+                        })
+                    except Exception as _e:
+                        items.append({
+                            "user_name": user_name,
+                            "path": full,
+                            "name": os.path.basename(full),
+                            "size": None,
+                            "is_directory": False,
+                            "modification_time": None,
+                            "error": str(_e),
+                        })
+
+                for dname in dirs:
+                    full = os.path.join(root, dname)
+                    try:
+                        stat = os.stat(full)
+                        rel_path = full.replace('/dbfs', '')
+                        items.append({
+                            "user_name": user_name,
+                            "path": rel_path,
+                            "name": dname,
+                            "size": None,
+                            "is_directory": True,
+                            "modification_time": str(int(stat.st_mtime * 1000)),
+                            "error": None,
+                        })
+                    except Exception as _e:
+                        items.append({
+                            "user_name": user_name,
+                            "path": full,
+                            "name": dname,
+                            "size": None,
+                            "is_directory": True,
+                            "modification_time": None,
+                            "error": str(_e),
+                        })
+
+            # Attach user metadata
+            for it in items:
+                it["user_id"] = user_info.get("id")
+                it["user_display_name"] = user_info.get("displayName")
+                it["user_email"] = user_info.get("userName")
+                if "error" not in it:
+                    it["error"] = None
+
+            # Log completion with count
+            try:
+                print(f"Worker finished traversal for start_path={start_path} user={user_name}: found {len(items)} items")
+            except Exception:
+                pass
+
+            return items
+        except Exception as e:
+            return [{
+                "user_name": user_info.get("userName", "unknown") if 'user_info' in locals() else "unknown",
+                "user_id": user_info.get("id", None) if 'user_info' in locals() else None,
+                "user_display_name": user_info.get("displayName", None) if 'user_info' in locals() else None,
+                "user_email": user_info.get("userName", None) if 'user_info' in locals() else None,
+                "path": start_path if 'start_path' in locals() else "unknown",
+                "name": os.path.basename(start_path) if 'start_path' in locals() else "unknown",
+                "size": None,
+                "is_directory": None,
+                "modification_time": None,
+                "error": str(e)
+            }]
 
 
 def get_databricks_cli_config(profile: Optional[str] = None) -> Optional[Dict]:
@@ -540,7 +874,7 @@ def profile_cluster_capabilities(workspace_url: str, token: str, cluster_id: Opt
     return profile
 
 
-def create_serverless_session(workspace_url: str, token: str, expected_python: Optional[str] = None, dbc_version: Optional[str] = None) -> SparkSession:
+def create_serverless_session(workspace_url: str, token: str, expected_python: Optional[str] = None, dbc_version: Optional[str] = None, environment_version: Optional[str] = None) -> SparkSession:
     """
     Create a Spark session for Databricks serverless compute using Databricks Connect SDK.
     
@@ -565,6 +899,13 @@ def create_serverless_session(workspace_url: str, token: str, expected_python: O
         os.environ["DATABRICKS_HOST"] = host
         os.environ["DATABRICKS_TOKEN"] = token
         os.environ["DATABRICKS_SERVERLESS_COMPUTE_ID"] = "auto"
+
+        # If caller provided an environment version, export it as a hint
+        if environment_version:
+            # This environment variable name is a convention used here as a hint;
+            # actual enforcement requires configuring the serverless compute or job environment.
+            os.environ["DATABRICKS_SERVERLESS_ENVIRONMENT_VERSION"] = environment_version
+            print(f"Requested serverless environment version: {environment_version}")
         
         # If the caller provided an expected Python, print a helpful hint
         if expected_python:
@@ -610,7 +951,7 @@ def create_serverless_session(workspace_url: str, token: str, expected_python: O
         )
 
 
-def create_spark_connect_session(workspace_url: str, token: str, cluster_id: Optional[str] = None, profile: Optional[Dict] = None, expected_python: Optional[str] = None, dbc_version: Optional[str] = None) -> SparkSession:
+def create_spark_connect_session(workspace_url: str, token: str, cluster_id: Optional[str] = None, profile: Optional[Dict] = None, expected_python: Optional[str] = None, dbc_version: Optional[str] = None, environment_version: Optional[str] = None) -> SparkSession:
     """
     Create a Spark Connect session to a Databricks cluster.
     Supports both traditional clusters and serverless compute.
@@ -630,7 +971,7 @@ def create_spark_connect_session(workspace_url: str, token: str, cluster_id: Opt
     # Handle serverless compute
     if cluster_id and cluster_id.lower() == "auto" or os.environ.get("DATABRICKS_SERVERLESS_COMPUTE_ID", "").lower() == "auto":
         print("Detected serverless compute configuration, using Databricks Connect SDK...")
-        return create_serverless_session(workspace_url, token, expected_python=expected_python, dbc_version=dbc_version)
+        return create_serverless_session(workspace_url, token, expected_python=expected_python, dbc_version=dbc_version, environment_version=environment_version)
     
     if not cluster_id:
         raise ValueError(
@@ -674,6 +1015,9 @@ def create_spark_connect_session(workspace_url: str, token: str, cluster_id: Opt
     # If caller specified a databricks-connect version, print guidance
     if dbc_version:
         print(f"Note: using databricks-connect version suggestion: {dbc_version} (install with pip if needed)")
+
+    if environment_version:
+        print(f"Note: requested environment version hint: {environment_version}")
 
     return spark
 
@@ -797,6 +1141,15 @@ Examples:
         default=None,
         help="Databricks cluster ID for Spark Connect (overrides profile and environment variable)"
     )
+
+    parser.add_argument(
+        "--connect-cluster",
+        "--connect-cluster-id",
+        dest="connect_cluster",
+        type=str,
+        default=None,
+        help="Explicit cluster ID to use for Spark Connect (takes precedence over profile and --cluster-id)"
+    )
     
     parser.add_argument(
         "--serverless",
@@ -830,6 +1183,13 @@ Examples:
         type=str,
         default=None,
         help="Explicit databricks-connect pip version to use (e.g. '16.1.7')."
+    )
+
+    parser.add_argument(
+        "--environment-version",
+        type=str,
+        default=None,
+        help="Optional serverless environment version identifier (pass-through hint for serverless configuration)."
     )
     
     parser.add_argument(
@@ -939,7 +1299,16 @@ def main(args=None):
     output_format = (args.format or os.environ.get("OUTPUT_FORMAT", "csv")).lower()
     
     # Handle cluster/serverless configuration
-    if args.serverless:
+    # Order of precedence (highest -> lowest): --connect-cluster, --serverless, --cluster-id, CLI profile, env vars
+    # If the user explicitly passes --connect-cluster, prefer it and do not enable serverless.
+    if getattr(args, 'connect_cluster', None):
+        # Explicit connect-cluster takes precedence over serverless and profile-derived cluster IDs
+        os.environ["DATABRICKS_CLUSTER_ID"] = args.connect_cluster
+        os.environ.pop("DATABRICKS_SERVERLESS_COMPUTE_ID", None)
+        # Remember that user explicitly requested this cluster id
+        explicit_connect_cluster = args.connect_cluster
+        print(f"Using explicit Spark Connect cluster from --connect-cluster: {args.connect_cluster} (overrides profile and --serverless)")
+    elif args.serverless:
         os.environ["DATABRICKS_SERVERLESS_COMPUTE_ID"] = "auto"
         os.environ.pop("DATABRICKS_CLUSTER_ID", None)  # Remove cluster ID if set
     elif args.cluster_id:
@@ -973,19 +1342,74 @@ def main(args=None):
             use_spark_connect = True
     
     # Validate configuration
+    # When running inside Databricks runtime, prefer using the current environment/context
+    # and do not require `--workspace-url`/`--token` to be provided explicitly.
     if not workspace_url or not databricks_token:
-        raise ValueError(
-            "DATABRICKS_WORKSPACE_URL and DATABRICKS_TOKEN must be set.\n"
-            "Options:\n"
-            "  1. Set environment variables:\n"
-            "     export DATABRICKS_WORKSPACE_URL='https://your-workspace.cloud.databricks.com'\n"
-            "     export DATABRICKS_TOKEN='your-token'\n"
-            "  2. Use Databricks CLI: databricks configure --token\n"
-            "  3. For Spark Connect, also set: export DATABRICKS_CLUSTER_ID='cluster-id'"
-        )
+        if not is_databricks_runtime:
+            raise ValueError(
+                "DATABRICKS_WORKSPACE_URL and DATABRICKS_TOKEN must be set.\n"
+                "Options:\n"
+                "  1. Set environment variables:\n"
+                "     export DATABRICKS_WORKSPACE_URL='https://your-workspace.cloud.databricks.com'\n"
+                "     export DATABRICKS_TOKEN='your-token'\n"
+                "  2. Use Databricks CLI: databricks configure --token\n"
+                "  3. For Spark Connect, also set: export DATABRICKS_CLUSTER_ID='cluster-id'"
+            )
+        else:
+            print("Running inside Databricks runtime: workspace URL / token not required as arguments.")
+            # Attempt to populate from CLI config or environment if available
+            if not workspace_url and cli_config and cli_config.get('workspace_url'):
+                workspace_url = cli_config.get('workspace_url')
+                print("Using workspace URL from Databricks CLI config")
+            if not databricks_token and cli_config and cli_config.get('token'):
+                databricks_token = cli_config.get('token')
+                print("Using token from Databricks CLI config")
     
     # Profile cluster capabilities before connecting
     cluster_id = os.environ.get("DATABRICKS_CLUSTER_ID") or os.environ.get("DATABRICKS_SERVERLESS_COMPUTE_ID", "")
+
+    # If not set, prefer cluster id passed by Databricks VS Code extension or other tooling
+    if not cluster_id:
+        for ev in ["DATABRICKS_CLUSTER_ID", "DBX_CLUSTER_ID", "DATABRICKS_CLUSTER"]:
+            if os.environ.get(ev):
+                cluster_id = os.environ.get(ev)
+                print(f"Using cluster id from environment ({ev}): {cluster_id}")
+                break
+
+    # When running inside Databricks runtime, try to get the cluster id from dbutils context
+    if not cluster_id and is_databricks_runtime:
+        try:
+            from pyspark.sql import SparkSession as _SparkSession
+            _spark = _SparkSession.builder.getOrCreate()
+            _dbutils = None
+            try:
+                import IPython
+                _dbutils = IPython.get_ipython().user_ns.get('dbutils')
+            except Exception:
+                _dbutils = None
+
+            if _dbutils is None:
+                try:
+                    _dbutils = _spark._jvm.com.databricks.service.DBUtils(_spark._jsc.sc())
+                except Exception:
+                    _dbutils = None
+
+            if _dbutils is not None:
+                try:
+                    ctx = _dbutils.notebook().getContext()
+                    try:
+                        cid = ctx.clusterId().get()
+                        if cid:
+                            cluster_id = cid
+                            os.environ["DATABRICKS_CLUSTER_ID"] = cid
+                            print(f"In-cluster: discovered cluster id from dbutils context: {cid}")
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+        except Exception:
+            # Ignore errors while attempting to introspect runtime context
+            pass
     if use_spark_connect and cluster_id:
         print("\n" + "="*60)
         print("CLUSTER CAPABILITY PROFILING")
@@ -1023,6 +1447,11 @@ def main(args=None):
         print("="*60 + "\n")
     
     # Initialize Spark session
+    # If the user explicitly provided a cluster id, prefer Spark Connect even when --no-spark-connect
+    if not use_spark_connect and ('explicit_connect_cluster' in locals() or (cluster_id and cluster_id != "")):
+        print("Explicit cluster id provided; overriding --no-spark-connect to use Spark Connect mode.")
+        use_spark_connect = True
+
     if use_spark_connect:
         print("Initializing Spark Connect session...")
         spark = create_spark_connect_session(
@@ -1031,15 +1460,39 @@ def main(args=None):
             cluster_id=cluster_id,
             profile=profile if 'profile' in locals() else None,
             expected_python=args.expected_python,
-            dbc_version=args.databricks_connect_version
+            dbc_version=args.databricks_connect_version,
+            environment_version=args.environment_version
         )
         session_type = "Serverless" if cluster_id and cluster_id.lower() == "auto" else "Spark Connect"
         print(f"✓ Connected to Databricks cluster via {session_type}")
+        # Announce which cluster id will be used for the run (if available)
+        run_cluster_id = cluster_id if cluster_id else (explicit_connect_cluster if 'explicit_connect_cluster' in locals() else None)
+        if run_cluster_id:
+            print(f"Running on cluster: {run_cluster_id}")
     else:
         print("Initializing native Spark session...")
-        spark = SparkSession.builder \
-            .appName("Databricks Workspace Inventory") \
-            .getOrCreate()
+        try:
+            spark = SparkSession.builder \
+                .appName("Databricks Workspace Inventory") \
+                .getOrCreate()
+        except RuntimeError as re:
+            # Some client environments (Spark Connect-only) do not support local/native sessions.
+            print(f"Local SparkSession creation failed: {str(re)}")
+            print("Falling back to Spark Connect session since a local native session is unavailable.")
+            spark = create_spark_connect_session(
+                workspace_url,
+                databricks_token,
+                cluster_id=cluster_id,
+                profile=profile if 'profile' in locals() else None,
+                expected_python=args.expected_python,
+                dbc_version=args.databricks_connect_version,
+                environment_version=args.environment_version
+            )
+            session_type = "Spark Connect"
+            print(f"✓ Connected to Databricks cluster via {session_type}")
+            run_cluster_id = cluster_id if cluster_id else (explicit_connect_cluster if 'explicit_connect_cluster' in locals() else None)
+            if run_cluster_id:
+                print(f"Running on cluster: {run_cluster_id}")
     
     # Get Databricks utilities
     dbutils = get_dbutils(spark)
@@ -1086,27 +1539,94 @@ def main(args=None):
             "workspace_url": workspace_url
         }
         user_data_list.append(json.dumps(user_data))
-
     print(f"\n[Step 2] Processing {len(user_data_list)} user home directories in parallel...")
 
-    # Create RDD and distribute work across Spark workers
-    num_slices = max(1, len(user_data_list))
-
-    # Spark Connect sessions do not expose `sparkContext` (JVM attribute). In that case
-    # fall back to sequential local processing (slower) so the script can still run.
+    # DRIVER-SIDE LISTING: if dbutils is available on the driver, perform the directory
+    # listing on the driver (where dbutils is present) and collect item metadata, then
+    # distribute the already-listed paths/rows for any further processing. This avoids
+    # requiring dbutils on worker nodes.
+    driver_listing_used = False
     items_list = None
-    try:
-        sc = spark.sparkContext
-        users_rdd = sc.parallelize(user_data_list, numSlices=num_slices)
-        # Process each user's directory in parallel
-        items_rdd = users_rdd.flatMap(process_user_directory)
-        # Collect results from RDD
-        items_list = items_rdd.collect()
-    except Exception as e:
-        # Most likely: Spark Connect / Databricks Connect where sparkContext is not supported
-        print("Warning: could not use sparkContext (likely Spark Connect). Falling back to sequential processing. This will be slower.")
-        if args.debug:
-            print(f"Debug: sparkContext error: {str(e)}")
+    if dbutils is not None:
+        try:
+            sc = None
+            try:
+                sc = spark.sparkContext
+            except Exception:
+                sc = None
+
+            # If we have a SparkContext and not forced to sequential, use hybrid frontier->worker approach
+            if sc is not None and not args.force_sequential:
+                print("dbutils found on driver — using hybrid driver-frontier + worker-depth approach")
+                tasks = []
+                limit = args.max_user if args.max_user and args.max_user > 0 else None
+                for uidx, user in enumerate(users, start=1):
+                    if limit and uidx > limit:
+                        break
+                    frontier = driver_enumerate_frontier(dbutils, user)
+                    if frontier:
+                        tasks.extend(frontier)
+
+                if not tasks:
+                    # Fall back to driver_list_user if frontier enumeration returned nothing
+                    items_list = []
+                    for uidx, user in enumerate(users, start=1):
+                        if limit and uidx > limit:
+                            break
+                        user_items = driver_list_user(dbutils, user)
+                        if user_items:
+                            items_list.extend(user_items)
+                        if args.debug:
+                            print(f"Driver listed user {uidx}/{total_available}")
+                    driver_listing_used = True
+                else:
+                    # Create task JSONs and parallelize to workers
+                    tasks_json = [json.dumps(t) for t in tasks]
+                    num_slices = min(len(tasks_json), max(1, getattr(sc, 'defaultParallelism', 4)))
+                    tasks_rdd = sc.parallelize(tasks_json, numSlices=num_slices)
+
+                    # Use flatMap to traverse each start_path on workers using /dbfs
+                    items_rdd = tasks_rdd.flatMap(worker_traverse_start)
+                    items_list = items_rdd.collect()
+                    driver_listing_used = True
+            else:
+                # No SparkContext or forced sequential: do full driver-side listing per user
+                print("dbutils found on driver — performing full driver-side listing (sequential)")
+                items_list = []
+                limit = args.max_user if args.max_user and args.max_user > 0 else None
+                for uidx, user in enumerate(users, start=1):
+                    if limit and uidx > limit:
+                        break
+                    user_items = driver_list_user(dbutils, user)
+                    if user_items:
+                        items_list.extend(user_items)
+                    if args.debug:
+                        print(f"Driver listed user {uidx}/{total_available}")
+                driver_listing_used = True
+        except Exception as e:
+            if args.debug:
+                print(f"Driver-side listing failed: {str(e)}")
+            items_list = None
+
+    # If we didn't use driver-side listing, fall back to previous distributed approaches
+    if not driver_listing_used:
+        # Create RDD and distribute work across Spark workers
+        num_slices = max(1, len(user_data_list))
+
+        # Spark Connect sessions do not expose `sparkContext` (JVM attribute). In that case
+        # fall back to sequential local processing (slower) so the script can still run.
+        try:
+            sc = spark.sparkContext
+            users_rdd = sc.parallelize(user_data_list, numSlices=num_slices)
+            # Process each user's directory in parallel
+            items_rdd = users_rdd.flatMap(process_user_directory)
+            # Collect results from RDD
+            items_list = items_rdd.collect()
+        except Exception as e:
+            # Most likely: Spark Connect / Databricks Connect where sparkContext is not supported
+            print("Warning: could not use sparkContext (likely Spark Connect). Falling back to sequential processing. This will be slower.")
+            if args.debug:
+                print(f"Debug: sparkContext error: {str(e)}")
 
         # First try to use DataFrame + mapInPandas which is supported by Spark Connect
         skip_map = bool(args.force_sequential)
@@ -1244,6 +1764,13 @@ def main(args=None):
     print(f"\n{'='*60}")
     print(f"INVENTORY SUMMARY")
     print(f"{'='*60}")
+    # Include which cluster was used for the run when available
+    try:
+        summary_cluster = cluster_id if cluster_id else (explicit_connect_cluster if 'explicit_connect_cluster' in locals() else None)
+        if summary_cluster:
+            print(f"  Cluster used for run: {summary_cluster}")
+    except Exception:
+        pass
     print(f"  Total users processed: {total_users}")
     print(f"  Total items found: {total_items}")
     print(f"    - Files: {file_count}")

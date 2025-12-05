@@ -1,0 +1,14 @@
+# Sample users file for databricks_user_files_simple.py
+# Lines starting with # are comments and will be ignored
+# One email address per line
+
+laurent.prat@databricks.com
+quentin.ambard@databricks.com
+yuval.danino@databricks.com
+vinicius.fialho@databricks.com
+valeria.kozel@databricks.com
+
+
+# You can add more users below
+# john.doe@company.com
+# jane.smith@company.com
