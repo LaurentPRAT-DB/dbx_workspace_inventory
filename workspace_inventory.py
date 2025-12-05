@@ -641,6 +641,23 @@ def create_spark_connect_session(workspace_url: str, token: str, cluster_id: Opt
         .remote(connect_url) \
         .getOrCreate()
     
+    # Attempt to infer server Python minor version from reported spark_version
+    server_python = None
+    try:
+        if 'profile' in locals() and profile and profile.get('spark_version'):
+            server_python = infer_python_from_spark_version(profile.get('spark_version'))
+            if server_python:
+                local_py = f"{sys.version_info.major}.{sys.version_info.minor}"
+                print(f"Detected approximate server Python: {server_python}; local Python: {local_py}")
+                if server_python != local_py:
+                    print("Warning: Python minor version differs between client and server.\n"
+                          "  - mapInPandas and other Python UDFs may fail when running via Spark Connect.\n"
+                          "  - Recommended: match the client's Python minor version to the server, or run with --force-sequential to avoid remote Python execution.")
+            else:
+                print("Could not infer server Python version from spark_version; consult Databricks release notes if needed.")
+    except Exception:
+        # Non-fatal; continue without inferred server Python
+        server_python = None
     return spark
 
 
@@ -661,6 +678,49 @@ def get_dbutils(spark):
             # For Spark Connect, dbutils might not be directly available
             # We'll use alternative methods in worker functions
             return None
+
+
+def infer_python_from_spark_version(spark_version: Optional[str]) -> Optional[str]:
+    """
+    Heuristically infer Databricks Python minor version from a cluster `spark_version` string.
+
+    This is best-effort and may be inaccurate for some runtimes; consult Databricks
+    release notes for authoritative mapping.
+
+    Returns a string like '3.10' or None if unknown.
+    """
+    if not spark_version:
+        return None
+
+    # Typical spark_version examples: '13.1.x-scala2.12', '12.2.x-scala2.12', '11.3.x'
+    try:
+        prefix = spark_version.split('.')[0]
+        # Some runtimes are two-part like '13.1', use first token
+        major_token = prefix.strip()
+        mapping = {
+            # These are approximate mappings — verify against Databricks release notes.
+            '10': '3.8',
+            '11': '3.9',
+            '12': '3.10',
+            '13': '3.11',
+            '14': '3.11',
+        }
+
+        if major_token.isdigit() and major_token in mapping:
+            return mapping[major_token]
+
+        # fallback: look for explicit python mention
+        low = spark_version.lower()
+        if 'python3.10' in low or 'py3.10' in low:
+            return '3.10'
+        if 'python3.9' in low or 'py3.9' in low:
+            return '3.9'
+        if 'python3.11' in low or 'py3.11' in low:
+            return '3.11'
+    except Exception:
+        return None
+
+    return None
 
 
 def parse_arguments():
@@ -760,6 +820,12 @@ Examples:
         type=int,
         default=None,
         help="Maximum number of users to retrieve from the workspace (default: all)"
+    )
+
+    parser.add_argument(
+        "--force-sequential",
+        action="store_true",
+        help="Force sequential processing on the driver (skip RDD and mapInPandas paths)"
     )
 
     parser.add_argument(
@@ -1005,69 +1071,78 @@ def main(args=None):
             print(f"Debug: sparkContext error: {str(e)}")
 
         # First try to use DataFrame + mapInPandas which is supported by Spark Connect
-        try:
-            # Create a small DataFrame with one column containing JSON strings of user_info
-            users_json = [{"user_json": json.dumps(json.loads(ud) if isinstance(ud, str) else ud)} for ud in user_data_list]
-            users_df = spark.createDataFrame(users_json)
+        skip_map = bool(args.force_sequential)
+        if skip_map and args.debug:
+            print("Skipping mapInPandas and RDD paths due to --force-sequential. Using sequential processing.")
 
-            # Define the schema for the output rows (same as final schema)
-            output_schema = StructType([
-                StructField("user_name", StringType(), True),
-                StructField("user_id", StringType(), True),
-                StructField("user_display_name", StringType(), True),
-                StructField("user_email", StringType(), True),
-                StructField("path", StringType(), True),
-                StructField("name", StringType(), True),
-                StructField("size", LongType(), True),
-                StructField("is_directory", StringType(), True),
-                StructField("modification_time", StringType(), True),
-                StructField("error", StringType(), True)
-            ])
+        if not skip_map:
+            try:
+                # Create a small DataFrame with one column containing JSON strings of user_info
+                users_json = [{"user_json": json.dumps(json.loads(ud) if isinstance(ud, str) else ud)} for ud in user_data_list]
+                users_df = spark.createDataFrame(users_json)
 
-            def map_process_user(iterator):
-                import pandas as _pd
-                import json as _json
+                # Define the schema for the output rows (same as final schema)
+                output_schema = StructType([
+                    StructField("user_name", StringType(), True),
+                    StructField("user_id", StringType(), True),
+                    StructField("user_display_name", StringType(), True),
+                    StructField("user_email", StringType(), True),
+                    StructField("path", StringType(), True),
+                    StructField("name", StringType(), True),
+                    StructField("size", LongType(), True),
+                    StructField("is_directory", StringType(), True),
+                    StructField("modification_time", StringType(), True),
+                    StructField("error", StringType(), True)
+                ])
 
-                for pdf in iterator:
-                    rows = []
-                    for user_json in pdf['user_json']:
-                        try:
-                            user = _json.loads(user_json)
-                            # Build payload expected by process_user_directory (JSON string)
-                            payload = _json.dumps({"user_info": user, "workspace_url": workspace_url})
-                            res = process_user_directory(payload)
-                            if res:
-                                rows.extend(res)
-                        except Exception as _ex:
-                            rows.append({
-                                "user_name": "unknown",
-                                "user_id": None,
-                                "user_display_name": None,
-                                "user_email": None,
-                                "path": "unknown",
-                                "name": "unknown",
-                                "size": None,
-                                "is_directory": None,
-                                "modification_time": None,
-                                "error": str(_ex)
-                            })
+                def map_process_user(iterator):
+                    import pandas as _pd
+                    import json as _json
 
-                    if rows:
-                        yield _pd.DataFrame(rows)
-                    else:
-                        # yield empty frame with correct columns to satisfy contract
-                        yield _pd.DataFrame(columns=[f.name for f in output_schema.fields])
+                    for pdf in iterator:
+                        rows = []
+                        for user_json in pdf['user_json']:
+                            try:
+                                user = _json.loads(user_json)
+                                # Build payload expected by process_user_directory (JSON string)
+                                payload = _json.dumps({"user_info": user, "workspace_url": workspace_url})
+                                res = process_user_directory(payload)
+                                if res:
+                                    rows.extend(res)
+                            except Exception as _ex:
+                                rows.append({
+                                    "user_name": "unknown",
+                                    "user_id": None,
+                                    "user_display_name": None,
+                                    "user_email": None,
+                                    "path": "unknown",
+                                    "name": "unknown",
+                                    "size": None,
+                                    "is_directory": None,
+                                    "modification_time": None,
+                                    "error": str(_ex)
+                                })
 
-            # Run in parallel on executors
-            result_df = users_df.mapInPandas(map_process_user, schema=output_schema)
+                        if rows:
+                            yield _pd.DataFrame(rows)
+                        else:
+                            # yield empty frame with correct columns to satisfy contract
+                            yield _pd.DataFrame(columns=[f.name for f in output_schema.fields])
 
-            # Collect results back to driver as list of dicts
-            items_rows = result_df.collect()
-            items_list = [r.asDict() for r in items_rows]
-        except Exception as e2:
-            if args.debug:
-                print(f"mapInPandas path failed: {str(e2)}")
+                # Run in parallel on executors
+                result_df = users_df.mapInPandas(map_process_user, schema=output_schema)
 
+                # Collect results back to driver as list of dicts
+                items_rows = result_df.collect()
+                items_list = [r.asDict() for r in items_rows]
+            except Exception as e2:
+                if args.debug:
+                    print(f"mapInPandas path failed: {str(e2)}")
+
+                # Fall back to sequential local processing
+                skip_map = True
+
+        if skip_map:
             # Final fallback: sequential local processing
             items_list = []
             for idx, ud in enumerate(user_data_list, start=1):
