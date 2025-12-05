@@ -4,16 +4,33 @@ Databricks User Listing Module
 Extracted from workspace_inventory.py - contains all user listing and authentication functionality.
 This module provides comprehensive user discovery via SCIM API with multiple authentication options.
 
+Features:
+- List all users in a Databricks workspace
+- Export email addresses to CSV (one per line)
+- Multiple authentication methods (CLI profiles, environment variables, dbutils)
+- Debug mode with progress tracking
+- Pagination support for large workspaces
+
 Usage:
     from databricks_user_list import get_all_users, authenticate_databricks
-    
+
     # Using CLI profile
     workspace_url, token = authenticate_databricks(profile="PROD")
     users = get_all_users(workspace_url, token, debug=True)
-    
+
     # Using environment variables
     workspace_url, token = authenticate_databricks()
     users = get_all_users(workspace_url, token, max_users=10)
+
+    # Command-line usage:
+    # List all users
+    python databricks_user_list.py --profile PROD
+
+    # Export email addresses to CSV (one per line)
+    python databricks_user_list.py --profile PROD --output users.csv
+
+    # Limit to first 50 users
+    python databricks_user_list.py --profile PROD --max-users 50 --output users.csv
 """
 
 import json
@@ -439,21 +456,36 @@ def get_all_users(workspace_url: str, token: str, debug: bool = False, max_users
 def main_example():
     """Example usage of the user listing functionality."""
     import argparse
-    
-    parser = argparse.ArgumentParser(description="List Databricks workspace users")
+
+    parser = argparse.ArgumentParser(
+        description="List Databricks workspace users",
+        epilog="""
+Examples:
+  # List all users
+  python databricks_user_list.py --profile PROD
+
+  # Save email addresses to CSV (one per line)
+  python databricks_user_list.py --profile PROD --output users.csv
+
+  # Limit to first 50 users
+  python databricks_user_list.py --profile PROD --max-users 50 --output users.csv
+        """,
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--profile", "-p", help="Databricks CLI profile name")
     parser.add_argument("--workspace-url", help="Workspace URL (overrides profile)")
     parser.add_argument("--token", help="Access token (overrides profile)")
+    parser.add_argument("--output", "-o", help="Output CSV file path (saves email addresses, one per line)")
     parser.add_argument("--debug", action="store_true", help="Enable debug output")
     parser.add_argument("--max-users", type=int, help="Maximum number of users to retrieve")
     parser.add_argument("--list-profiles", action="store_true", help="List available profiles")
-    
+
     args = parser.parse_args()
-    
+
     if args.list_profiles:
         list_available_profiles()
         return
-    
+
     try:
         # Authenticate
         workspace_url, token = authenticate_databricks(
@@ -461,25 +493,49 @@ def main_example():
             workspace_url=args.workspace_url,
             token=args.token
         )
-        
+
         print(f"Workspace: {workspace_url}")
         print("Fetching users...")
-        
+
         # Get users
         users = get_all_users(workspace_url, token, debug=args.debug, max_users=args.max_users)
-        
-        print(f"\nFound {len(users)} users:")
-        for i, user in enumerate(users, 1):
-            username = user.get("userName", "unknown")
-            display_name = user.get("displayName", "")
-            email = user.get("userName", "")  # userName is typically the email
-            
-            print(f"{i:3d}. {username}")
-            if display_name and display_name != username:
-                print(f"     Display: {display_name}")
-            if email and email != username:
-                print(f"     Email: {email}")
-                
+
+        print(f"\nFound {len(users)} users")
+
+        # Extract email addresses
+        emails = []
+        for user in users:
+            email = user.get("userName", "")
+            if email:
+                emails.append(email)
+
+        # Save to CSV if output file specified
+        if args.output:
+            try:
+                with open(args.output, 'w', newline='') as f:
+                    for email in emails:
+                        f.write(f"{email}\n")
+
+                print(f"\n✓ Saved {len(emails)} email addresses to: {args.output}")
+                print(f"  Format: One email per line")
+
+            except Exception as e:
+                print(f"\n✗ Error writing to CSV: {str(e)}")
+                sys.exit(1)
+        else:
+            # Display users if no output file
+            print("\nUsers:")
+            for i, user in enumerate(users, 1):
+                username = user.get("userName", "unknown")
+                display_name = user.get("displayName", "")
+                email = user.get("userName", "")  # userName is typically the email
+
+                print(f"{i:3d}. {username}")
+                if display_name and display_name != username:
+                    print(f"     Display: {display_name}")
+
+            print(f"\nTip: Use --output users.csv to save email addresses to a file")
+
     except Exception as e:
         print(f"Error: {str(e)}")
         sys.exit(1)
