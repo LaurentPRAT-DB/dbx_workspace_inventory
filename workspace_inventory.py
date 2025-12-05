@@ -725,6 +725,15 @@ Examples:
         help="List available Databricks CLI profiles and exit"
     )
     
+    parser.add_argument(
+        "--max-user",
+        "--max-users",
+        dest="max_user",
+        type=int,
+        default=None,
+        help="Maximum number of users to retrieve from the workspace (default: all)"
+    )
+    
     return parser.parse_args()
 
 
@@ -908,27 +917,44 @@ def main(args=None):
     print("\n[Step 1] Fetching users from workspace...")
     users = get_databricks_users(workspace_url, databricks_token)
     print(f"Found {len(users)} users in the workspace")
-    
+
     if not users:
         print("No users found in the workspace. Exiting.")
         spark.stop()
         return
-    
+
+    # If requested, limit the number of users to process
+    if args.max_user and args.max_user > 0:
+        print(f"Limiting to first {args.max_user} users")
+
     # Step 2: Parallelize user processing using Spark
-    print(f"\n[Step 2] Processing {len(users)} user home directories in parallel...")
-    
     # Prepare user data with configuration for worker nodes
     user_data_list = []
+    limit = args.max_user if args.max_user and args.max_user > 0 else None
+    current = 0
+    total_available = len(users)
+
     for user in users:
+        current += 1
+        if limit and current > limit:
+            break
+
+        user_name = user.get("userName") or user.get("displayName") or user.get("id") or "unknown"
+        display_total = limit if limit else total_available
+        print(f"Retrieved user {current}/{display_total}: {user_name}")
+
         user_data = {
             "user_info": user,
             "workspace_url": workspace_url
         }
         user_data_list.append(json.dumps(user_data))
-    
+
+    print(f"\n[Step 2] Processing {len(user_data_list)} user home directories in parallel...")
+
     # Create RDD and distribute work across Spark workers
-    users_rdd = spark.sparkContext.parallelize(user_data_list, numSlices=len(users))
-    
+    num_slices = max(1, len(user_data_list))
+    users_rdd = spark.sparkContext.parallelize(user_data_list, numSlices=num_slices)
+
     # Process each user's directory in parallel
     items_rdd = users_rdd.flatMap(process_user_directory)
     
