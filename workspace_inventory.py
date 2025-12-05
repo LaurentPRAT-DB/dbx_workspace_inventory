@@ -10,7 +10,7 @@ This version is optimized for Databricks runtime environment.
 """
 
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col
+from pyspark.sql.functions import col, when, lit, sum as _sum, countDistinct
 from pyspark.sql.types import StructType, StructField, StringType, LongType
 import argparse
 import json
@@ -21,14 +21,16 @@ from typing import List, Dict, Optional
 import requests
 
 
-def get_databricks_users(workspace_url: str, token: str) -> List[Dict]:
+def get_databricks_users(workspace_url: str, token: str, debug: bool = False, max_users: Optional[int] = None) -> List[Dict]:
     """
-    Retrieve all users from Databricks workspace using the SCIM API.
-    
+    Retrieve users from Databricks workspace using the SCIM API.
+
     Args:
         workspace_url: Databricks workspace URL (e.g., https://your-workspace.cloud.databricks.com)
         token: Databricks personal access token
-        
+        debug: If True, print progress while fetching users (useful when listing is slow)
+        max_users: Optional maximum number of users to retrieve (stops early)
+
     Returns:
         List of user dictionaries containing user information
     """
@@ -49,22 +51,48 @@ def get_databricks_users(workspace_url: str, token: str) -> List[Dict]:
         }
         
         try:
+            if debug:
+                print(f"Requesting users: startIndex={start_index}, count={items_per_page}...")
+
             response = requests.get(url, headers=headers, params=params, timeout=30)
             response.raise_for_status()
             
             data = response.json()
             resources = data.get("Resources", [])
-            
-            if not resources:
-                break
-                
-            users.extend(resources)
-            
-            # Check if there are more pages
             total_results = data.get("totalResults", 0)
-            if start_index + items_per_page > total_results:
+
+            if not resources:
+                if debug:
+                    print("No more users returned by API.")
                 break
-                
+
+            # Append resources one by one so we can stream progress and stop early if requested
+            for r in resources:
+                users.append(r)
+                if debug:
+                    name = r.get("userName") or r.get("displayName") or r.get("id") or "unknown"
+                    suffix = f"/{total_results}" if total_results else ""
+                    print(f"Retrieved user {len(users)}{suffix}: {name}")
+
+                if max_users and len(users) >= max_users:
+                    if debug:
+                        print(f"Reached max_users={max_users}; stopping early.")
+                    break
+
+            # If we reached max_users, break outer loop
+            if max_users and len(users) >= max_users:
+                break
+
+            # Check if there are more pages
+            if total_results and (start_index + items_per_page) > total_results:
+                if debug:
+                    print(f"Fetched all reported users ({len(users)}/{total_results}).")
+                break
+
+            # Brief progress feedback when debug is enabled
+            if debug and total_results:
+                print(f"Progress: {len(users)}/{total_results} users retrieved so far...")
+
             start_index += items_per_page
         except Exception as e:
             print(f"Error fetching users: {str(e)}")
@@ -733,6 +761,12 @@ Examples:
         default=None,
         help="Maximum number of users to retrieve from the workspace (default: all)"
     )
+
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug output (prints progress while fetching users)"
+    )
     
     return parser.parse_args()
 
@@ -915,7 +949,7 @@ def main(args=None):
     
     # Step 1: Get all users from the workspace
     print("\n[Step 1] Fetching users from workspace...")
-    users = get_databricks_users(workspace_url, databricks_token)
+    users = get_databricks_users(workspace_url, databricks_token, debug=args.debug, max_users=args.max_user)
     print(f"Found {len(users)} users in the workspace")
 
     if not users:
@@ -953,10 +987,98 @@ def main(args=None):
 
     # Create RDD and distribute work across Spark workers
     num_slices = max(1, len(user_data_list))
-    users_rdd = spark.sparkContext.parallelize(user_data_list, numSlices=num_slices)
 
-    # Process each user's directory in parallel
-    items_rdd = users_rdd.flatMap(process_user_directory)
+    # Spark Connect sessions do not expose `sparkContext` (JVM attribute). In that case
+    # fall back to sequential local processing (slower) so the script can still run.
+    items_list = None
+    try:
+        sc = spark.sparkContext
+        users_rdd = sc.parallelize(user_data_list, numSlices=num_slices)
+        # Process each user's directory in parallel
+        items_rdd = users_rdd.flatMap(process_user_directory)
+        # Collect results from RDD
+        items_list = items_rdd.collect()
+    except Exception as e:
+        # Most likely: Spark Connect / Databricks Connect where sparkContext is not supported
+        print("Warning: could not use sparkContext (likely Spark Connect). Falling back to sequential processing. This will be slower.")
+        if args.debug:
+            print(f"Debug: sparkContext error: {str(e)}")
+
+        # First try to use DataFrame + mapInPandas which is supported by Spark Connect
+        try:
+            # Create a small DataFrame with one column containing JSON strings of user_info
+            users_json = [{"user_json": json.dumps(json.loads(ud) if isinstance(ud, str) else ud)} for ud in user_data_list]
+            users_df = spark.createDataFrame(users_json)
+
+            # Define the schema for the output rows (same as final schema)
+            output_schema = StructType([
+                StructField("user_name", StringType(), True),
+                StructField("user_id", StringType(), True),
+                StructField("user_display_name", StringType(), True),
+                StructField("user_email", StringType(), True),
+                StructField("path", StringType(), True),
+                StructField("name", StringType(), True),
+                StructField("size", LongType(), True),
+                StructField("is_directory", StringType(), True),
+                StructField("modification_time", StringType(), True),
+                StructField("error", StringType(), True)
+            ])
+
+            def map_process_user(iterator):
+                import pandas as _pd
+                import json as _json
+
+                for pdf in iterator:
+                    rows = []
+                    for user_json in pdf['user_json']:
+                        try:
+                            user = _json.loads(user_json)
+                            # Build payload expected by process_user_directory (JSON string)
+                            payload = _json.dumps({"user_info": user, "workspace_url": workspace_url})
+                            res = process_user_directory(payload)
+                            if res:
+                                rows.extend(res)
+                        except Exception as _ex:
+                            rows.append({
+                                "user_name": "unknown",
+                                "user_id": None,
+                                "user_display_name": None,
+                                "user_email": None,
+                                "path": "unknown",
+                                "name": "unknown",
+                                "size": None,
+                                "is_directory": None,
+                                "modification_time": None,
+                                "error": str(_ex)
+                            })
+
+                    if rows:
+                        yield _pd.DataFrame(rows)
+                    else:
+                        # yield empty frame with correct columns to satisfy contract
+                        yield _pd.DataFrame(columns=[f.name for f in output_schema.fields])
+
+            # Run in parallel on executors
+            result_df = users_df.mapInPandas(map_process_user, schema=output_schema)
+
+            # Collect results back to driver as list of dicts
+            items_rows = result_df.collect()
+            items_list = [r.asDict() for r in items_rows]
+        except Exception as e2:
+            if args.debug:
+                print(f"mapInPandas path failed: {str(e2)}")
+
+            # Final fallback: sequential local processing
+            items_list = []
+            for idx, ud in enumerate(user_data_list, start=1):
+                if args.debug:
+                    print(f"Sequentially processing user {idx}/{len(user_data_list)}")
+                try:
+                    res = process_user_directory(ud)
+                    if res:
+                        items_list.extend(res)
+                except Exception as ex:
+                    print(f"Error processing user data sequentially: {str(ex)}")
     
     # Step 3: Convert to DataFrame
     print("\n[Step 3] Converting results to DataFrame...")
@@ -975,27 +1097,36 @@ def main(args=None):
         StructField("error", StringType(), True)
     ])
     
-    # Collect results and create DataFrame
-    items_list = items_rdd.collect()
-    
-    if not items_list:
-        print("No items found in any user home directory. Exiting.")
-        spark.stop()
-        return
-    
-    df = spark.createDataFrame(items_list, schema=schema)
+    # If we have a distributed DataFrame (result_df from mapInPandas), use it directly
+    if 'result_df' in locals():
+        df = result_df
+    else:
+        # Otherwise we should have items_list collected from RDD or sequential path
+        if not items_list:
+            print("No items found in any user home directory. Exiting.")
+            spark.stop()
+            return
+
+        df = spark.createDataFrame(items_list, schema=schema)
     
     # Step 4: Generate summary statistics
     print("\n[Step 4] Generating summary statistics...")
     
-    total_items = df.count()
-    total_users = df.select("user_name").distinct().count()
-    
-    # Calculate total size (only for files, not directories)
-    files_df = df.filter(col("is_directory") == "false").filter(col("error").isNull())
-    total_size = files_df.agg({"size": "sum"}).collect()[0][0] or 0
-    file_count = files_df.count()
-    dir_count = df.filter(col("is_directory") == "true").count()
+    # Compute summary statistics in one distributed aggregation to avoid multiple shuffles
+    agg = df.agg(
+        _sum(lit(1)).alias("total_items"),
+        countDistinct(col("user_name")).alias("total_users"),
+        _sum(when((col("is_directory") == False) | (col("is_directory") == "false"), 1).otherwise(0)).alias("file_count"),
+        _sum(when((col("is_directory") == True) | (col("is_directory") == "true"), 1).otherwise(0)).alias("dir_count"),
+        _sum(when(((col("is_directory") == False) | (col("is_directory") == "false")) & col("error").isNull(), col("size")).otherwise(0)).alias("total_size")
+    )
+
+    agg_row = agg.collect()[0]
+    total_items = int(agg_row["total_items"] or 0)
+    total_users = int(agg_row["total_users"] or 0)
+    file_count = int(agg_row["file_count"] or 0)
+    dir_count = int(agg_row["dir_count"] or 0)
+    total_size = int(agg_row["total_size"] or 0)
     
     print(f"\n{'='*60}")
     print(f"INVENTORY SUMMARY")
