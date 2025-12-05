@@ -1,0 +1,25 @@
+# Databricks Workspace Inventory Application Requirements
+# 
+# Note: PySpark is typically pre-installed in Databricks runtime environments
+# If running locally with Spark Connect or serverless compute, install dependencies below
+
+# Core dependencies
+requests>=2.28.0
+
+# PySpark with Spark Connect support (for local execution)
+# Required for Spark Connect to traditional Databricks clusters
+pyspark>=3.5.0
+
+# Databricks Connect SDK (for serverless compute support)
+# Required when using serverless compute (DATABRICKS_SERVERLESS_COMPUTE_ID=auto)
+# Install with: pip install databricks-connect
+# Note: Version must match your Databricks Runtime version
+# databricks-connect>=14.0.0
+
+# Optional: For better type hints and development
+typing-extensions>=4.0.0
+
+# Optional: Databricks CLI (for authentication and cluster management)
+# Install separately: pip install databricks-cli
+# Or use: brew install databricks-cli (macOS)
+
