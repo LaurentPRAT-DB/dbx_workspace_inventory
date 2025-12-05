@@ -540,7 +540,7 @@ def profile_cluster_capabilities(workspace_url: str, token: str, cluster_id: Opt
     return profile
 
 
-def create_serverless_session(workspace_url: str, token: str) -> SparkSession:
+def create_serverless_session(workspace_url: str, token: str, expected_python: Optional[str] = None, dbc_version: Optional[str] = None) -> SparkSession:
     """
     Create a Spark session for Databricks serverless compute using Databricks Connect SDK.
     
@@ -566,6 +566,10 @@ def create_serverless_session(workspace_url: str, token: str) -> SparkSession:
         os.environ["DATABRICKS_TOKEN"] = token
         os.environ["DATABRICKS_SERVERLESS_COMPUTE_ID"] = "auto"
         
+        # If the caller provided an expected Python, print a helpful hint
+        if expected_python:
+            print(f"Requested expected server Python: {expected_python}")
+
         # Create session - the SDK should use DATABRICKS_TOKEN from environment
         # Note: If this fails with OAuth errors, the user may need to reauthenticate
         # or ensure their ~/.databrickscfg uses token-based auth, not OAuth
@@ -574,6 +578,12 @@ def create_serverless_session(workspace_url: str, token: str) -> SparkSession:
         return spark
         
     except ImportError:
+        if dbc_version:
+            raise ImportError(
+                "Databricks Connect SDK is required for serverless compute.\n"
+                f"Install the matching version with: pip install databricks-connect=={dbc_version}\n"
+                "Note: Version must match your Databricks Runtime version."
+            )
         raise ImportError(
             "Databricks Connect SDK is required for serverless compute.\n"
             "Install it with: pip install databricks-connect\n"
@@ -600,7 +610,7 @@ def create_serverless_session(workspace_url: str, token: str) -> SparkSession:
         )
 
 
-def create_spark_connect_session(workspace_url: str, token: str, cluster_id: Optional[str] = None) -> SparkSession:
+def create_spark_connect_session(workspace_url: str, token: str, cluster_id: Optional[str] = None, profile: Optional[Dict] = None, expected_python: Optional[str] = None, dbc_version: Optional[str] = None) -> SparkSession:
     """
     Create a Spark Connect session to a Databricks cluster.
     Supports both traditional clusters and serverless compute.
@@ -618,9 +628,9 @@ def create_spark_connect_session(workspace_url: str, token: str, cluster_id: Opt
         cluster_id = os.environ.get("DATABRICKS_CLUSTER_ID") or os.environ.get("DATABRICKS_SERVERLESS_COMPUTE_ID", "")
     
     # Handle serverless compute
-    if cluster_id.lower() == "auto" or os.environ.get("DATABRICKS_SERVERLESS_COMPUTE_ID", "").lower() == "auto":
+    if cluster_id and cluster_id.lower() == "auto" or os.environ.get("DATABRICKS_SERVERLESS_COMPUTE_ID", "").lower() == "auto":
         print("Detected serverless compute configuration, using Databricks Connect SDK...")
-        return create_serverless_session(workspace_url, token)
+        return create_serverless_session(workspace_url, token, expected_python=expected_python, dbc_version=dbc_version)
     
     if not cluster_id:
         raise ValueError(
@@ -640,24 +650,31 @@ def create_spark_connect_session(workspace_url: str, token: str, cluster_id: Opt
         .appName("Databricks Workspace Inventory") \
         .remote(connect_url) \
         .getOrCreate()
-    
-    # Attempt to infer server Python minor version from reported spark_version
+
+    # Determine server Python (use explicit expected_python if provided, else try to infer)
     server_python = None
     try:
-        if 'profile' in locals() and profile and profile.get('spark_version'):
+        if expected_python:
+            server_python = expected_python
+        elif profile and profile.get('spark_version'):
             server_python = infer_python_from_spark_version(profile.get('spark_version'))
-            if server_python:
-                local_py = f"{sys.version_info.major}.{sys.version_info.minor}"
-                print(f"Detected approximate server Python: {server_python}; local Python: {local_py}")
-                if server_python != local_py:
-                    print("Warning: Python minor version differs between client and server.\n"
-                          "  - mapInPandas and other Python UDFs may fail when running via Spark Connect.\n"
-                          "  - Recommended: match the client's Python minor version to the server, or run with --force-sequential to avoid remote Python execution.")
-            else:
-                print("Could not infer server Python version from spark_version; consult Databricks release notes if needed.")
+
+        if server_python:
+            local_py = f"{sys.version_info.major}.{sys.version_info.minor}"
+            print(f"Detected (or requested) server Python: {server_python}; local Python: {local_py}")
+            if server_python != local_py:
+                print("Warning: Python minor version differs between client and server.\n"
+                      "  - mapInPandas and other Python UDFs may fail when running via Spark Connect.\n"
+                      "  - Recommended: match the client's Python minor version to the server, or run with --force-sequential to avoid remote Python execution.")
+        else:
+            print("Could not infer server Python version from spark_version; consult Databricks release notes if needed.")
     except Exception:
-        # Non-fatal; continue without inferred server Python
         server_python = None
+
+    # If caller specified a databricks-connect version, print guidance
+    if dbc_version:
+        print(f"Note: using databricks-connect version suggestion: {dbc_version} (install with pip if needed)")
+
     return spark
 
 
@@ -799,6 +816,20 @@ Examples:
         choices=["csv", "parquet", "delta"],
         default=None,
         help="Output format (default: csv)"
+    )
+
+    parser.add_argument(
+        "--expected-python",
+        type=str,
+        default=None,
+        help="Expected Python version on the server (e.g. '3.11' or full '3.11.14')."
+    )
+
+    parser.add_argument(
+        "--databricks-connect-version",
+        type=str,
+        default=None,
+        help="Explicit databricks-connect pip version to use (e.g. '16.1.7')."
     )
     
     parser.add_argument(
@@ -994,7 +1025,14 @@ def main(args=None):
     # Initialize Spark session
     if use_spark_connect:
         print("Initializing Spark Connect session...")
-        spark = create_spark_connect_session(workspace_url, databricks_token)
+        spark = create_spark_connect_session(
+            workspace_url,
+            databricks_token,
+            cluster_id=cluster_id,
+            profile=profile if 'profile' in locals() else None,
+            expected_python=args.expected_python,
+            dbc_version=args.databricks_connect_version
+        )
         session_type = "Serverless" if cluster_id and cluster_id.lower() == "auto" else "Spark Connect"
         print(f"✓ Connected to Databricks cluster via {session_type}")
     else:
