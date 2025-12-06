@@ -55,6 +55,10 @@ Thumbs.db
 
 .databricks
 
-# Ignore files with user email addresses and results
+# Ignore files with user email addresses
 user_email*
+
+# ignore file with results_*
 results_*
+*.csv
+*.parquet
