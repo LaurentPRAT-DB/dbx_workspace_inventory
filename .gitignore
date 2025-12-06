@@ -22,6 +22,7 @@ wheels/
 
 # Virtual environments
 venv/
+.venv*/
 ENV/
 env/
 
@@ -55,10 +56,6 @@ Thumbs.db
 
 .databricks
 
-# Ignore files with user email addresses
+# Ignore files with user email addresses and results
 user_email*
-
-# ignore file with results_*
 results_*
-*.csv
-*.parquet
