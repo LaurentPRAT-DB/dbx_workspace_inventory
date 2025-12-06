@@ -456,6 +456,7 @@ def get_all_users(workspace_url: str, token: str, debug: bool = False, max_users
 def main_example():
     """Example usage of the user listing functionality."""
     import argparse
+    from datetime import datetime
 
     parser = argparse.ArgumentParser(
         description="List Databricks workspace users",
@@ -486,6 +487,13 @@ Examples:
         list_available_profiles()
         return
 
+    # Record start time
+    start_time = datetime.now()
+    print(f"\n{'='*80}")
+    print(f"DATABRICKS USER LISTING")
+    print(f"{'='*80}")
+    print(f"Start time: {start_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+
     try:
         # Authenticate
         workspace_url, token = authenticate_databricks(
@@ -495,7 +503,7 @@ Examples:
         )
 
         print(f"Workspace: {workspace_url}")
-        print("Fetching users...")
+        print("Fetching users...\n")
 
         # Get users
         users = get_all_users(workspace_url, token, debug=args.debug, max_users=args.max_users)
@@ -521,6 +529,13 @@ Examples:
 
             except Exception as e:
                 print(f"\n✗ Error writing to CSV: {str(e)}")
+                # Record end time even on error
+                end_time = datetime.now()
+                duration = end_time - start_time
+                print(f"\n{'='*80}")
+                print(f"End time: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                print(f"Duration: {duration}")
+                print(f"{'='*80}\n")
                 sys.exit(1)
         else:
             # Display users if no output file
@@ -536,8 +551,44 @@ Examples:
 
             print(f"\nTip: Use --output users.csv to save email addresses to a file")
 
+        # Record end time and calculate duration
+        end_time = datetime.now()
+        duration = end_time - start_time
+
+        # Format duration nicely
+        total_seconds = int(duration.total_seconds())
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+
+        if hours > 0:
+            duration_str = f"{hours}h {minutes}m {seconds}s"
+        elif minutes > 0:
+            duration_str = f"{minutes}m {seconds}s"
+        else:
+            duration_str = f"{seconds}s"
+
+        print(f"\n{'='*80}")
+        print(f"COMPLETED SUCCESSFULLY")
+        print(f"{'='*80}")
+        print(f"End time: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Duration: {duration_str}")
+        print(f"Users processed: {len(users)}")
+        if args.output:
+            print(f"Output file: {args.output}")
+        print(f"{'='*80}\n")
+
     except Exception as e:
+        # Record end time even on error
+        end_time = datetime.now()
+        duration = end_time - start_time
+
+        print(f"\n{'='*80}")
+        print(f"ERROR")
+        print(f"{'='*80}")
         print(f"Error: {str(e)}")
+        print(f"End time: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Duration: {duration}")
+        print(f"{'='*80}\n")
         sys.exit(1)
 
 

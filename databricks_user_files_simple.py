@@ -1117,13 +1117,18 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
     Returns:
         List of result dictionaries for each user
     """
+    from datetime import datetime
+
+    parallel_start_time = datetime.now()
+
     try:
         from pyspark.sql import SparkSession
         from pyspark.sql.types import StructType, StructField, StringType, LongType
 
         print(f"\n{'='*80}")
         print(f"PARALLEL PROCESSING {len(usernames)} USERS USING SPARK CLUSTER")
-        print(f"{'='*80}\n")
+        print(f"{'='*80}")
+        print(f"Parallel start time: {parallel_start_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
 
         # Create or get Spark session
         if cluster_id:
@@ -1204,11 +1209,31 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
                 "error": row.error
             })
 
+        # Calculate parallel processing duration
+        parallel_end_time = datetime.now()
+        parallel_duration = parallel_end_time - parallel_start_time
+
+        total_seconds = int(parallel_duration.total_seconds())
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+
+        if hours > 0:
+            duration_str = f"{hours}h {minutes}m {seconds}s"
+        elif minutes > 0:
+            duration_str = f"{minutes}m {seconds}s"
+        else:
+            duration_str = f"{seconds}s"
+
+        print(f"Parallel processing completed in {duration_str}\n")
+
         return results
 
     except Exception as e:
+        parallel_end_time = datetime.now()
+        parallel_duration = parallel_end_time - parallel_start_time
+
         if debug:
-            print(f"Parallel processing failed: {str(e)}")
+            print(f"Parallel processing failed after {parallel_duration}: {str(e)}")
             print("Falling back to sequential processing...\n")
         # Return empty to trigger fallback
         return None
@@ -1415,6 +1440,7 @@ def process_multiple_users(usernames: List[str], workspace_url: Optional[str] = 
 def main():
     """Example usage of the user file listing functionality."""
     import argparse
+    from datetime import datetime
 
     parser = argparse.ArgumentParser(
         description="List files in Databricks user home directories with parallel processing",
@@ -1473,6 +1499,19 @@ Performance Note:
     seen = set()
     usernames = [u for u in usernames if not (u in seen or seen.add(u))]
 
+    # Record start time
+    start_time = datetime.now()
+    print(f"\n{'='*80}")
+    print(f"DATABRICKS USER FILES LISTING")
+    print(f"{'='*80}")
+    print(f"Start time: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Users to process: {len(usernames)}")
+    if args.cluster_id and len(usernames) > 1:
+        print(f"Mode: PARALLEL (using cluster {args.cluster_id})")
+    else:
+        print(f"Mode: SEQUENTIAL")
+    print(f"{'='*80}\n")
+
     try:
         if len(usernames) == 1:
             # Single user - detailed output
@@ -1522,8 +1561,44 @@ Performance Note:
                 parallel=not args.no_parallel  # Enable parallel by default unless --no-parallel
             )
 
+        # Record end time and calculate duration
+        end_time = datetime.now()
+        duration = end_time - start_time
+
+        # Format duration nicely
+        total_seconds = int(duration.total_seconds())
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+
+        if hours > 0:
+            duration_str = f"{hours}h {minutes}m {seconds}s"
+        elif minutes > 0:
+            duration_str = f"{minutes}m {seconds}s"
+        else:
+            duration_str = f"{seconds}s"
+
+        print(f"\n{'='*80}")
+        print(f"COMPLETED SUCCESSFULLY")
+        print(f"{'='*80}")
+        print(f"End time: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Duration: {duration_str}")
+        print(f"Users processed: {len(usernames)}")
+        if args.output:
+            print(f"Output file: {args.output}")
+        print(f"{'='*80}\n")
+
     except Exception as e:
+        # Record end time even on error
+        end_time = datetime.now()
+        duration = end_time - start_time
+
+        print(f"\n{'='*80}")
+        print(f"ERROR")
+        print(f"{'='*80}")
         print(f"Error: {str(e)}")
+        print(f"End time: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Duration: {duration}")
+        print(f"{'='*80}\n")
         sys.exit(1)
 
 
