@@ -4,9 +4,6 @@
 
 laurent.prat@databricks.com
 quentin.ambard@databricks.com
-yuval.danino@databricks.com
-vinicius.fialho@databricks.com
-valeria.kozel@databricks.com
 
 
 # You can add more users below
