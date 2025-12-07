@@ -309,6 +309,43 @@ Examples:
     --output results.csv
 ```
 
+### Debug Mode - Real-Time Progress
+
+Enable `--debug` to see per-user progress in real-time, even during parallel processing:
+
+```bash
+python databricks_user_files_simple.py \
+  --users-file users.csv \
+  --profile PROD \
+  --cluster-id 1234-567890-abc123 \
+  --debug
+```
+
+**Example Output:**
+```
+Processing users across workers (showing results as they complete)...
+
+  [1/100] ✓ john.doe@company.com: 1234 files (52.7 MB)
+  [2/100] ✓ jane.smith@company.com: 567 files (24.2 MB)
+  [3/100] ⚠ alice.wong@company.com: 0 files (0 B)
+  [4/100] ✗ bob.jones@company.com: 0 files (0 B) - User directory does not exist
+  [5/100] ✓ carol.white@company.com: 890 files (37.5 MB)
+  ...
+```
+
+**Status Icons:**
+- ✓ Success: Files found
+- ⚠ Empty: Directory exists but no files
+- ✗ Error: Scan failed (permission, missing directory, etc.)
+
+**Benefits:**
+- See progress as workers complete each user
+- Identify errors immediately while processing continues
+- Estimate completion time with `[N/total]` counter
+- Perfect for development, testing, and troubleshooting
+
+See [DEBUG_OUTPUT.md](DEBUG_OUTPUT.md) for full details.
+
 ---
 
 ## Authentication

@@ -1193,21 +1193,48 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
         print("Distributing work to cluster workers...")
         result_df = users_df.mapInPandas(process_users_batch, schema=output_schema)
 
-        # Collect results
-        print("Collecting results from workers...\n")
-        results_rows = result_df.collect()
+        # Collect results with progress output in debug mode
+        if debug:
+            print("Processing users across workers (showing results as they complete)...\n")
+            results = []
+            processed_count = 0
 
-        # Convert to list of dicts
-        results = []
-        for row in results_rows:
-            results.append({
-                "username": row.username,
-                "file_count": int(row.file_count or 0),
-                "total_size": int(row.total_size or 0),
-                "dir_count": int(row.dir_count or 0),
-                "status": row.status,
-                "error": row.error
-            })
+            # Use toLocalIterator for incremental result streaming
+            for row in result_df.toLocalIterator():
+                processed_count += 1
+                result = {
+                    "username": row.username,
+                    "file_count": int(row.file_count or 0),
+                    "total_size": int(row.total_size or 0),
+                    "dir_count": int(row.dir_count or 0),
+                    "status": row.status,
+                    "error": row.error
+                }
+                results.append(result)
+
+                # Show per-user progress
+                size_str = format_bytes(result["total_size"])
+                status_icon = "✓" if result["status"] == "success" else ("⚠" if result["status"] == "empty" else "✗")
+                error_msg = f" - {result['error']}" if result['error'] else ""
+                print(f"  [{processed_count}/{len(usernames)}] {status_icon} {result['username']}: "
+                      f"{result['file_count']} files ({size_str}){error_msg}")
+
+            print()  # Empty line after all users
+        else:
+            print("Collecting results from workers...\n")
+            results_rows = result_df.collect()
+
+            # Convert to list of dicts
+            results = []
+            for row in results_rows:
+                results.append({
+                    "username": row.username,
+                    "file_count": int(row.file_count or 0),
+                    "total_size": int(row.total_size or 0),
+                    "dir_count": int(row.dir_count or 0),
+                    "status": row.status,
+                    "error": row.error
+                })
 
         # Calculate parallel processing duration
         parallel_end_time = datetime.now()
@@ -1285,16 +1312,17 @@ def process_multiple_users(usernames: List[str], workspace_url: Optional[str] = 
 
         # If parallel processing succeeded, skip sequential
         if results is not None:
-            # Print individual results
-            for idx, result in enumerate(results, 1):
-                print(f"[{idx}/{total_users}] {result['username']}")
-                if result['status'] == 'success':
-                    print(f"  ✓ Files: {result['file_count']:,}, Size: {format_size(result['total_size'])}")
-                elif result['status'] == 'empty':
-                    print(f"  ⊘ Empty directory")
-                else:
-                    print(f"  ✗ Error: {result['error']}")
-                print()
+            # Print individual results (skip if debug mode already printed them during processing)
+            if not debug:
+                for idx, result in enumerate(results, 1):
+                    print(f"[{idx}/{total_users}] {result['username']}")
+                    if result['status'] == 'success':
+                        print(f"  ✓ Files: {result['file_count']:,}, Size: {format_size(result['total_size'])}")
+                    elif result['status'] == 'empty':
+                        print(f"  ⊘ Empty directory")
+                    else:
+                        print(f"  ✗ Error: {result['error']}")
+                    print()
 
             # Jump to summary section
             print(f"{'='*80}")
