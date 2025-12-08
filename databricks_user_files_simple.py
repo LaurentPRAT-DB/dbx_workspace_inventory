@@ -642,7 +642,7 @@ def estimate_user_files_via_api(workspace_url: str, token: str, username: str,
                                 cluster_id: Optional[str] = None, debug: bool = False) -> Tuple[str, str]:
     """
     Try to get user file information using Databricks APIs and Spark.
-    If cluster_id is provided, attempts actual file listing via Spark Connect.
+    If cluster_id is provided, prioritizes Spark Connect method over direct API.
     """
     try:
         user_info = get_user_info_via_api(workspace_url, token, username, debug=debug)
@@ -650,9 +650,54 @@ def estimate_user_files_via_api(workspace_url: str, token: str, username: str,
         user_display = user_info.get("displayName", username)
         user_email = user_info.get("userName", username)
 
-        # First, try the simple API-based approach (no Spark or cluster needed)
+        # If cluster_id is provided, prioritize using the cluster
+        if cluster_id:
+            if debug:
+                print(f"Cluster ID provided: {cluster_id}")
+                print("Attempting to list files via Spark Connect (using cluster workers)...")
+
+            file_count, total_size, status = try_list_user_files_via_spark(
+                workspace_url, token, username, cluster_id, debug=debug
+            )
+
+            if status == "success":
+                message = f"""User Information:
+  Username: {username}
+  Display Name: {user_display}
+  Email: {user_email}
+  Home Directory: /Users/{username}
+
+File Listing Status:
+  ✅ Successfully listed DBFS files via Spark Connect
+  ✅ Traditional cluster /dbfs mount accessible
+  ✅ Distributed file processing working
+
+Results:
+  Files found: {file_count}
+  Total size: {total_size:,} bytes ({total_size / (1024**3):.2f} GB)
+
+Technical Details:
+  - Connection type: Spark Connect (Traditional Cluster)
+  - Cluster ID: {cluster_id}
+  - Method: Distributed processing via Spark workers accessing DBFS
+  - Authentication: ✅ Working
+  - File system access: ✅ Working via /dbfs mount
+
+Note: This accessed DBFS (Databricks File System), not Workspace files.
+  Use the Workspace API method (without --cluster-id) for notebooks and workspace files."""
+                return "success", message
+            else:
+                # Spark method didn't succeed, fall back to API method
+                if debug:
+                    print(f"Spark method status: {status}")
+                    print("Falling back to direct DBFS API method...")
+
+        # Try the direct API-based approach (no Spark or cluster needed)
         if debug:
-            print("Attempting to list files via Workspace API (direct, no cluster needed)...")
+            if cluster_id:
+                print("Attempting to list files via DBFS API (fallback, no cluster needed)...")
+            else:
+                print("Attempting to list files via DBFS API (direct, no cluster needed)...")
 
         file_count, total_size, status = list_user_files_via_api_direct(
             workspace_url, token, username, debug=debug
@@ -686,131 +731,29 @@ Note: This lists all files in DBFS under /Users/{username}
   Including notebooks, libraries, data files, etc."""
             return "success", message
 
-        # If API method didn't work and cluster_id is provided, try Spark method
-        if cluster_id and status != "success_api":
-            if debug:
-                print(f"API method status: {status}")
-                print(f"Cluster ID provided: {cluster_id}")
-                print("Attempting fallback to Spark Connect for DBFS file access...")
-
-            file_count, total_size, status = try_list_user_files_via_spark(
-                workspace_url, token, username, cluster_id, debug=debug
-            )
-
-            if status == "success":
-                message = f"""User Information:
+        # If we get here, both methods failed (or only API method tried if no cluster_id)
+        if cluster_id:
+            message = f"""User Information:
   Username: {username}
   Display Name: {user_display}
   Email: {user_email}
   Home Directory: /Users/{username}
 
 File Listing Status:
-  ✅ Successfully listed DBFS files via Spark Connect
-  ✅ Traditional cluster /dbfs mount accessible
-  ✅ Distributed file processing working
-
-Results:
-  Files found: {file_count}
-  Total size: {total_size:,} bytes ({total_size / (1024**3):.2f} GB)
+  ❌ Both Spark Connect and DBFS API methods failed
 
 Technical Details:
-  - Connection type: Spark Connect (Traditional Cluster)
+  - Spark Connect (attempted first): Failed with status: {status}
+  - DBFS API (attempted as fallback): Failed with status: {status}
   - Cluster ID: {cluster_id}
-  - Method: Distributed processing via Spark workers accessing DBFS
-  - Authentication: ✅ Working
-  - File system access: ✅ Working via /dbfs mount
-
-Note: This accessed DBFS (Databricks File System), not Workspace files.
-  Use the Workspace API method (without --cluster-id) for notebooks and workspace files."""
-                return "success", message
-            elif status == "dbfs_mount_not_available":
-                message = f"""User Information:
-  Username: {username}
-  Display Name: {user_display}
-  Email: {user_email}
-  Home Directory: /Users/{username}
-
-File Listing Status:
-  ❌ DBFS mount not accessible on cluster workers for distributed processing
-  ℹ️  The Workspace API method already ran and found {file_count} files
-
-Why /dbfs mount is needed (for this Spark-based method):
-  - Spark Connect workers need /dbfs FUSE mount to access DBFS files
-  - This enables distributed processing across multiple workers
-  - Serverless clusters don't provide /dbfs mount to workers
-  - This is only needed for DBFS files, not Workspace notebooks/files
-
-Technical Details:
-  - Connection type: Spark Connect
-  - Cluster ID: {cluster_id}
-  - Status: {status}
-
-You have two options:
-  1. Use Workspace API method (already tried, found {file_count} files)
-     - No cluster needed
-     - Works for notebooks and workspace files
-     - Cannot access raw DBFS files
-
-  2. Use traditional cluster for DBFS access (if you need DBFS files)
-     - Requires all-purpose or job cluster (not serverless)
-     - Enables distributed processing
-     - Can access raw files in DBFS"""
-                return "failed", message
-            elif status == "no_files_found":
-                message = f"""User Information:
-  Username: {username}
-  Display Name: {user_display}
-  Email: {user_email}
-  Home Directory: /Users/{username}
-
-File Listing Status:
-  ✅ Connection successful
-  ℹ️  No files found in user's home directory
-
-Technical Details:
-  - Connection type: Spark Connect (Traditional Cluster)
-  - Cluster ID: {cluster_id}
-  - Status: User directory is empty or doesn't exist"""
-                return "failed", message
-            elif status == "python_version_mismatch":
-                message = f"""User Information:
-  Username: {username}
-  Display Name: {user_display}
-  Email: {user_email}
-  Home Directory: /Users/{username}
-
-File Listing Status:
-  ❌ Python version mismatch between client and cluster
-
-Technical Details:
-  - Connection type: Spark Connect (Traditional Cluster)
-  - Cluster ID: {cluster_id}
-  - Status: {status}
-
-Solution:
-  Match your local Python version to the cluster's runtime, or use --force-sequential mode in workspace_inventory.py"""
-                return "failed", message
-            else:
-                message = f"""User Information:
-  Username: {username}
-  Display Name: {user_display}
-  Email: {user_email}
-  Home Directory: /Users/{username}
-
-File Listing Status:
-  ❌ File listing via Spark Connect failed
-
-Technical Details:
-  - Connection type: Spark Connect (Traditional Cluster)
-  - Cluster ID: {cluster_id}
-  - Status: {status}
 
 Troubleshooting:
   1. Verify the cluster is running: databricks clusters list
   2. Verify the cluster ID is correct
   3. Check if the cluster has the required permissions
-  4. Try running with --debug flag for more details"""
-                return "failed", message
+  4. Verify the user directory exists: /Users/{username}
+  5. Try running with --debug flag for more details"""
+            return "failed", message
 
         # If we get here, API method didn't find files and either no cluster or Spark method also failed
         if status == "no_files_found_api" or status == "no_files_found":
