@@ -1237,7 +1237,9 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
         users_df = users_df.repartition(num_partitions)
 
         if debug:
-            actual_partitions = users_df.rdd.getNumPartitions()
+            # Use num_partitions directly (already calculated above)
+            # Note: Cannot use .rdd.getNumPartitions() in Spark Connect
+            actual_partitions = num_partitions
             print(f"DataFrame partitioned into {actual_partitions} partitions for parallel processing")
             print(f"Each partition will be processed by a different executor")
 
@@ -1249,6 +1251,9 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
                 print(f"\nWith {num_workers} worker(s), expect ~{actual_partitions // num_workers} partitions per worker")
                 print(f"All {num_workers} workers will start processing their partitions simultaneously")
             print()
+        else:
+            # Set actual_partitions for later use in non-debug mode
+            actual_partitions = num_partitions
 
         # Define output schema
         output_schema = StructType([
