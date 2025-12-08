@@ -997,6 +997,7 @@ def process_user_on_worker(user_data: str) -> Dict:
     """
     import json
     import time
+    from datetime import datetime
 
     try:
         data = json.loads(user_data)
@@ -1004,6 +1005,11 @@ def process_user_on_worker(user_data: str) -> Dict:
         workspace_url = data["workspace_url"]
         token = data["token"]
         debug = data.get("debug", False)
+
+        # Debug: Print start time on worker
+        start_time = datetime.now()
+        if debug:
+            print(f"[WORKER START] {username} - {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
 
         # Import requests on the worker
         import requests
@@ -1081,6 +1087,14 @@ def process_user_on_worker(user_data: str) -> Dict:
         # Process the user
         list_recursive(home_path)
 
+        # Debug: Print completion time on worker
+        end_time = datetime.now()
+        duration = end_time - start_time
+        duration_seconds = duration.total_seconds()
+        if debug:
+            print(f"[WORKER COMPLETE] {username} - {end_time.strftime('%Y-%m-%d %H:%M:%S')} "
+                  f"(duration: {duration_seconds:.1f}s, files: {file_count}, size: {total_size})")
+
         return {
             "username": username,
             "file_count": file_count,
@@ -1091,6 +1105,15 @@ def process_user_on_worker(user_data: str) -> Dict:
         }
 
     except Exception as e:
+        # Debug: Print error completion time on worker
+        if 'start_time' in locals() and 'data' in locals() and data.get("debug", False):
+            end_time = datetime.now()
+            duration = end_time - start_time
+            duration_seconds = duration.total_seconds()
+            username_str = data.get("username", "unknown")
+            print(f"[WORKER ERROR] {username_str} - {end_time.strftime('%Y-%m-%d %H:%M:%S')} "
+                  f"(duration: {duration_seconds:.1f}s, error: {str(e)})")
+
         return {
             "username": data.get("username", "unknown") if 'data' in locals() else "unknown",
             "file_count": 0,

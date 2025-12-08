@@ -325,11 +325,17 @@ python databricks_user_files_simple.py \
 ```
 Processing users across workers (showing results as they complete)...
 
-  [1/100] ✓ john.doe@company.com: 1234 files (52.7 MB)
-  [2/100] ✓ jane.smith@company.com: 567 files (24.2 MB)
-  [3/100] ⚠ alice.wong@company.com: 0 files (0 B)
-  [4/100] ✗ bob.jones@company.com: 0 files (0 B) - User directory does not exist
-  [5/100] ✓ carol.white@company.com: 890 files (37.5 MB)
+[WORKER START] john.doe@company.com - 2025-12-08 14:30:05
+[WORKER START] jane.smith@company.com - 2025-12-08 14:30:05
+[WORKER START] alice.wong@company.com - 2025-12-08 14:30:05
+[WORKER COMPLETE] alice.wong@company.com - 2025-12-08 14:30:08 (duration: 3.2s, files: 0, size: 0)
+  [1/100] ⚠ alice.wong@company.com: 0 files (0 B)
+[WORKER ERROR] bob.jones@company.com - 2025-12-08 14:30:10 (duration: 5.1s, error: User directory does not exist)
+  [2/100] ✗ bob.jones@company.com: 0 files (0 B) - User directory does not exist
+[WORKER COMPLETE] john.doe@company.com - 2025-12-08 14:30:15 (duration: 10.3s, files: 1234, size: 55234567)
+  [3/100] ✓ john.doe@company.com: 1234 files (52.7 MB)
+[WORKER COMPLETE] jane.smith@company.com - 2025-12-08 14:30:16 (duration: 11.2s, files: 567, size: 25467890)
+  [4/100] ✓ jane.smith@company.com: 567 files (24.2 MB)
   ...
 ```
 
@@ -338,9 +344,17 @@ Processing users across workers (showing results as they complete)...
 - ⚠ Empty: Directory exists but no files
 - ✗ Error: Scan failed (permission, missing directory, etc.)
 
+**Debug Output Shows:**
+- **Worker-level timing**: When each worker starts/completes processing a user
+- **Per-user duration**: How long each user took to scan (e.g., `duration: 10.3s`)
+- **Parallel execution**: Multiple `[WORKER START]` lines appearing together
+- **Real-time progress**: Results stream in as workers finish
+
 **Benefits:**
 - See progress as workers complete each user
 - Identify errors immediately while processing continues
+- Verify parallel execution and cluster efficiency
+- Track per-user timing to find bottlenecks
 - Estimate completion time with `[N/total]` counter
 - Perfect for development, testing, and troubleshooting
 

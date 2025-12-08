@@ -31,12 +31,24 @@ Each worker will independently scan assigned users using DBFS API
 Distributing work to cluster workers...
 Processing users across workers (showing results as they complete)...
 
-  [1/100] ✓ john.doe@company.com: 1234 files (52.7 MB)
-  [2/100] ✓ jane.smith@company.com: 567 files (24.2 MB)
-  [3/100] ⚠ alice.wong@company.com: 0 files (0 B)
-  [4/100] ✗ bob.jones@company.com: 0 files (0 B) - User directory does not exist
+[WORKER START] john.doe@company.com - 2025-12-07 14:30:05
+[WORKER START] jane.smith@company.com - 2025-12-07 14:30:05
+[WORKER START] alice.wong@company.com - 2025-12-07 14:30:05
+[WORKER START] bob.jones@company.com - 2025-12-07 14:30:05
+[WORKER COMPLETE] alice.wong@company.com - 2025-12-07 14:30:08 (duration: 3.2s, files: 0, size: 0)
+  [1/100] ⚠ alice.wong@company.com: 0 files (0 B)
+[WORKER START] carol.white@company.com - 2025-12-07 14:30:08
+[WORKER ERROR] bob.jones@company.com - 2025-12-07 14:30:10 (duration: 5.1s, error: User directory does not exist)
+  [2/100] ✗ bob.jones@company.com: 0 files (0 B) - User directory does not exist
+[WORKER START] dave.miller@company.com - 2025-12-07 14:30:10
+[WORKER COMPLETE] john.doe@company.com - 2025-12-07 14:30:15 (duration: 10.3s, files: 1234, size: 55234567)
+  [3/100] ✓ john.doe@company.com: 1234 files (52.7 MB)
+[WORKER COMPLETE] jane.smith@company.com - 2025-12-07 14:30:16 (duration: 11.2s, files: 567, size: 25467890)
+  [4/100] ✓ jane.smith@company.com: 567 files (24.2 MB)
+[WORKER COMPLETE] carol.white@company.com - 2025-12-07 14:30:18 (duration: 10.1s, files: 890, size: 39345678)
   [5/100] ✓ carol.white@company.com: 890 files (37.5 MB)
   ...
+[WORKER COMPLETE] zack.morris@company.com - 2025-12-07 14:35:13 (duration: 8.7s, files: 445, size: 19876543)
   [100/100] ✓ zack.morris@company.com: 445 files (18.9 MB)
 
 Parallel processing completed in 5m 15s
@@ -85,6 +97,38 @@ When errors occur, they're shown inline:
 [15/100] ✗ user@company.com: 0 files (0 B) - RESOURCE_DOES_NOT_EXIST: User directory not found
 ```
 
+### Worker-Level Debug Output
+
+In debug mode, you also see detailed timing from **inside each worker** as it processes users:
+
+**Format:**
+```
+[WORKER START] username - timestamp
+[WORKER COMPLETE] username - timestamp (duration: Xs, files: N, size: B)
+[WORKER ERROR] username - timestamp (duration: Xs, error: message)
+```
+
+**What this shows:**
+- **Parallel Execution**: Multiple `[WORKER START]` lines appearing simultaneously show workers processing users in parallel
+- **Per-User Duration**: See exactly how long each user took to scan (e.g., `duration: 10.3s`)
+- **Worker Assignment**: Track which workers are busy and when they pick up new work
+- **Bottleneck Detection**: Identify users that take significantly longer to process
+
+**Example Timeline:**
+```
+14:30:05 - 4 workers start processing 4 users simultaneously
+14:30:08 - Worker completes user A (3.2s), immediately starts user E
+14:30:10 - Worker completes user B with error (5.1s), immediately starts user F
+14:30:15 - Worker completes user C (10.3s), immediately starts user G
+14:30:16 - Worker completes user D (11.2s), immediately starts user H
+```
+
+This fine-grained timing helps you:
+- **Verify parallelism**: See that workers are processing concurrently
+- **Optimize cluster size**: Determine if you need more/fewer workers
+- **Identify slow users**: Find users with large directories or complex structures
+- **Debug worker issues**: See if specific workers are slower than others
+
 ## Benefits
 
 ### 1. Real-Time Visibility
@@ -104,14 +148,34 @@ The `[42/100]` counter lets you estimate completion time
 
 ## Technical Implementation
 
-### Parallel Mode
+### Parallel Mode - Driver-Side Progress
 Uses Spark's `toLocalIterator()` instead of `collect()` to stream results incrementally:
 
 ```python
-# Streams results as they complete on workers
+# Streams results as they complete on workers (driver side)
 for row in result_df.toLocalIterator():
     print(f"  [{count}/{total}] ✓ {row.username}: {row.file_count} files...")
 ```
+
+### Parallel Mode - Worker-Side Progress
+Each worker prints timing information as it processes users:
+
+```python
+# Inside process_user_on_worker() function
+start_time = datetime.now()
+if debug:
+    print(f"[WORKER START] {username} - {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+# ... process user ...
+
+end_time = datetime.now()
+duration = end_time - start_time
+if debug:
+    print(f"[WORKER COMPLETE] {username} - {end_time.strftime('%Y-%m-%d %H:%M:%S')} "
+          f"(duration: {duration.total_seconds():.1f}s, files: {file_count}, size: {total_size})")
+```
+
+Worker stdout is streamed to the driver console via Spark Connect, so you see both worker-level and driver-level output in real-time.
 
 ### Sequential Mode
 Already shows per-user progress by default (no special debug mode needed):
@@ -207,27 +271,36 @@ This is better for:
 | Feature | Non-Debug Mode | Debug Mode |
 |---------|---------------|------------|
 | Per-user progress | ❌ Only at end | ✅ Real-time |
-| Status icons | ❌ | ✅ |
-| Error details | ❌ Only in summary | ✅ Inline |
+| Worker-level timing | ❌ | ✅ Start/complete timestamps |
+| Per-user duration | ❌ | ✅ Shown in seconds |
+| Status icons | ❌ | ✅ ✓ ⚠ ✗ |
+| Error details | ❌ Only in summary | ✅ Inline with timing |
 | Progress counter | ❌ | ✅ [N/total] |
-| Output volume | Low | Medium |
+| Parallel visibility | ❌ | ✅ See workers in action |
+| Output volume | Low | High (detailed) |
 | Best for | Production/automation | Development/troubleshooting |
 
 ## Tips
 
-1. **Use debug for initial runs** - Understand what's happening
-2. **Disable debug for production** - Cleaner logs
+1. **Use debug for initial runs** - Understand what's happening and verify parallelism
+2. **Disable debug for production** - Cleaner logs, less output
 3. **Combine with output file** - Progress on screen, data to CSV
-4. **Monitor rate limits** - Debug shows when retries occur
-5. **Identify slow users** - See which users take longest
+4. **Watch worker timing** - `[WORKER START]` lines appearing together = parallel execution
+5. **Monitor per-user duration** - Identify users that take >30s to process
+6. **Identify slow users** - Compare durations to find outliers
+7. **Verify cluster efficiency** - If workers complete at same time, you might be underutilized
+8. **Debug rate limiting** - Long durations often indicate rate limit retries
 
 ## Summary
 
 The `--debug` flag transforms parallel processing from a "black box" into a transparent, monitored operation where you can:
-- See exactly which users are being processed
-- Monitor progress in real-time
-- Identify errors immediately
-- Estimate completion time
-- Debug issues without waiting for full completion
+- **See exactly which users are being processed** - Real-time progress with `[N/total]` counter
+- **Monitor worker activity** - `[WORKER START]` and `[WORKER COMPLETE]` show parallel execution
+- **Track per-user timing** - Know how long each user takes (e.g., `duration: 10.3s`)
+- **Identify errors immediately** - See failures with context and timing
+- **Verify parallelism** - Multiple workers starting simultaneously confirms parallel execution
+- **Estimate completion time** - Progress counter and per-user durations help predict finish time
+- **Optimize cluster size** - Timing patterns reveal if you need more/fewer workers
+- **Debug performance issues** - Find slow users, rate limiting, or worker bottlenecks
 
-Perfect for development, testing, and troubleshooting large workspace scans!
+Perfect for development, testing, troubleshooting, and performance optimization of large workspace scans!
