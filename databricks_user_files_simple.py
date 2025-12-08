@@ -1150,18 +1150,62 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
                 .remote(connect_url) \
                 .getOrCreate()
 
-            # Show cluster configuration for parallel processing insight
+            # Get cluster configuration
+            num_workers = None
             if debug:
                 try:
+                    # Get cluster information via Databricks API
+                    import requests
+                    cluster_info_url = f"{workspace_url}/api/2.0/clusters/get"
+                    headers = {"Authorization": f"Bearer {token}"}
+                    cluster_response = requests.get(
+                        cluster_info_url,
+                        headers=headers,
+                        params={"cluster_id": cluster_id},
+                        timeout=10
+                    )
+                    if cluster_response.status_code == 200:
+                        cluster_data = cluster_response.json()
+                        num_workers = cluster_data.get("num_workers", None)
+                        if num_workers is None:
+                            # Check for autoscaling
+                            autoscale = cluster_data.get("autoscale", {})
+                            min_workers = autoscale.get("min_workers", None)
+                            max_workers = autoscale.get("max_workers", None)
+                            if min_workers and max_workers:
+                                print(f"Cluster: {cluster_id}")
+                                print(f"Workers: Autoscaling from {min_workers} to {max_workers} workers")
+                                num_workers = max_workers  # Use max for planning
+                            else:
+                                # Single node cluster
+                                print(f"Cluster: {cluster_id}")
+                                print(f"Workers: Single-node cluster (0 workers, driver only)")
+                                num_workers = 1
+                        else:
+                            print(f"Cluster: {cluster_id}")
+                            print(f"Workers: {num_workers} worker node(s) available")
+                    else:
+                        print(f"Cluster: {cluster_id}")
+                        print(f"Workers: Unable to query cluster info (will use Spark defaults)")
+
                     # Get default parallelism which indicates available executor slots
                     default_parallelism = spark.sparkContext.defaultParallelism
-                    print(f"Cluster default parallelism: {default_parallelism} (indicates ~{default_parallelism} concurrent tasks)")
-                    print(f"This means up to {default_parallelism} users can be processed simultaneously\n")
-                except:
-                    pass
+                    print(f"Default parallelism: {default_parallelism} concurrent tasks")
+
+                    if num_workers:
+                        cores_per_worker = default_parallelism // max(num_workers, 1)
+                        print(f"Estimated cores per worker: ~{cores_per_worker}")
+
+                    print(f"Maximum concurrent users: ~{default_parallelism}")
+                    print()
+
+                except Exception as e:
+                    print(f"Note: Could not retrieve detailed cluster info: {str(e)}")
+                    print()
         else:
             # Try to use existing session
             spark = SparkSession.builder.getOrCreate()
+            num_workers = None
 
         # Prepare user data
         user_data_list = []
@@ -1195,7 +1239,16 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
         if debug:
             actual_partitions = users_df.rdd.getNumPartitions()
             print(f"DataFrame partitioned into {actual_partitions} partitions for parallel processing")
-            print(f"Each partition will be processed by a different executor\n")
+            print(f"Each partition will be processed by a different executor")
+
+            # Show distribution estimate
+            users_per_partition = len(user_data_list) / actual_partitions
+            print(f"Average users per partition: ~{users_per_partition:.1f}")
+
+            if num_workers and num_workers > 0:
+                print(f"\nWith {num_workers} worker(s), expect ~{actual_partitions // num_workers} partitions per worker")
+                print(f"All {num_workers} workers will start processing their partitions simultaneously")
+            print()
 
         # Define output schema
         output_schema = StructType([
@@ -1258,7 +1311,17 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
                     yield pd.DataFrame(columns=["username", "file_count", "total_size", "dir_count", "status", "error"])
 
         # Execute parallel processing
-        print("Distributing work to cluster workers...")
+        if debug:
+            print(f"{'='*80}")
+            print(f"STARTING PARALLEL EXECUTION")
+            print(f"{'='*80}")
+            print(f"Work distribution: {actual_partitions} partitions across cluster workers")
+            print(f"Execution mode: All partitions will start processing in parallel")
+            print(f"Workers will process their assigned partitions simultaneously")
+            print(f"{'='*80}\n")
+        else:
+            print("Distributing work to cluster workers...")
+
         result_df = users_df.mapInPandas(process_users_batch, schema=output_schema)
 
         # Collect results with progress output in debug mode
