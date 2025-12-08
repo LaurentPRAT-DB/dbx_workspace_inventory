@@ -323,18 +323,28 @@ python databricks_user_files_simple.py \
 
 **Example Output:**
 ```
+Users to be distributed:
+  1. john.doe@company.com
+  2. jane.smith@company.com
+  3. alice.wong@company.com
+  ...
+
+Distributing work to cluster workers...
 Processing users across workers (showing results as they complete)...
 
-[WORKER START] john.doe@company.com - 2025-12-08 14:30:05
-[WORKER START] jane.smith@company.com - 2025-12-08 14:30:05
-[WORKER START] alice.wong@company.com - 2025-12-08 14:30:05
-[WORKER COMPLETE] alice.wong@company.com - 2025-12-08 14:30:08 (duration: 3.2s, files: 0, size: 0)
+[WORKER BATCH] Executor-0 received 4 user(s): john.doe@company.com, jane.smith@company.com, ...
+[WORKER BATCH] Executor-1 received 3 user(s): alice.wong@company.com, bob.jones@company.com, ...
+
+[WORKER START] Executor-0 processing john.doe@company.com - 2025-12-08 14:30:05
+[WORKER START] Executor-0 processing jane.smith@company.com - 2025-12-08 14:30:05
+[WORKER START] Executor-1 processing alice.wong@company.com - 2025-12-08 14:30:05
+[WORKER COMPLETE] Executor-1 finished alice.wong@company.com - 2025-12-08 14:30:08 (duration: 3.2s, files: 0, size: 0)
   [1/100] ⚠ alice.wong@company.com: 0 files (0 B)
-[WORKER ERROR] bob.jones@company.com - 2025-12-08 14:30:10 (duration: 5.1s, error: User directory does not exist)
+[WORKER ERROR] Executor-1 failed bob.jones@company.com - 2025-12-08 14:30:10 (duration: 5.1s, error: User directory does not exist)
   [2/100] ✗ bob.jones@company.com: 0 files (0 B) - User directory does not exist
-[WORKER COMPLETE] john.doe@company.com - 2025-12-08 14:30:15 (duration: 10.3s, files: 1234, size: 55234567)
+[WORKER COMPLETE] Executor-0 finished john.doe@company.com - 2025-12-08 14:30:15 (duration: 10.3s, files: 1234, size: 55234567)
   [3/100] ✓ john.doe@company.com: 1234 files (52.7 MB)
-[WORKER COMPLETE] jane.smith@company.com - 2025-12-08 14:30:16 (duration: 11.2s, files: 567, size: 25467890)
+[WORKER COMPLETE] Executor-0 finished jane.smith@company.com - 2025-12-08 14:30:16 (duration: 11.2s, files: 567, size: 25467890)
   [4/100] ✓ jane.smith@company.com: 567 files (24.2 MB)
   ...
 ```
@@ -345,9 +355,12 @@ Processing users across workers (showing results as they complete)...
 - ✗ Error: Scan failed (permission, missing directory, etc.)
 
 **Debug Output Shows:**
+- **User distribution list**: All users to be processed before work starts
+- **Batch assignment**: Which users are assigned to which executor/worker
+- **Worker identification**: Each message shows the executor ID (e.g., `Executor-0`)
 - **Worker-level timing**: When each worker starts/completes processing a user
 - **Per-user duration**: How long each user took to scan (e.g., `duration: 10.3s`)
-- **Parallel execution**: Multiple `[WORKER START]` lines appearing together
+- **Parallel execution**: Multiple executors processing simultaneously
 - **Real-time progress**: Results stream in as workers finish
 
 **Benefits:**

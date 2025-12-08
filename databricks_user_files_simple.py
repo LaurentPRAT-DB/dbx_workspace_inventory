@@ -949,10 +949,20 @@ def process_user_on_worker(user_data: str) -> Dict:
         token = data["token"]
         debug = data.get("debug", False)
 
+        # Get worker/executor information
+        worker_info = "Unknown"
+        try:
+            from pyspark import TaskContext
+            task_context = TaskContext.get()
+            if task_context:
+                worker_info = f"Executor-{task_context.partitionId()}"
+        except:
+            pass
+
         # Debug: Print start time on worker
         start_time = datetime.now()
         if debug:
-            print(f"[WORKER START] {username} - {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"[WORKER START] {worker_info} processing {username} - {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
 
         # Import requests on the worker
         import requests
@@ -1035,7 +1045,7 @@ def process_user_on_worker(user_data: str) -> Dict:
         duration = end_time - start_time
         duration_seconds = duration.total_seconds()
         if debug:
-            print(f"[WORKER COMPLETE] {username} - {end_time.strftime('%Y-%m-%d %H:%M:%S')} "
+            print(f"[WORKER COMPLETE] {worker_info} finished {username} - {end_time.strftime('%Y-%m-%d %H:%M:%S')} "
                   f"(duration: {duration_seconds:.1f}s, files: {file_count}, size: {total_size})")
 
         return {
@@ -1054,7 +1064,8 @@ def process_user_on_worker(user_data: str) -> Dict:
             duration = end_time - start_time
             duration_seconds = duration.total_seconds()
             username_str = data.get("username", "unknown")
-            print(f"[WORKER ERROR] {username_str} - {end_time.strftime('%Y-%m-%d %H:%M:%S')} "
+            worker_info_str = worker_info if 'worker_info' in locals() else "Unknown"
+            print(f"[WORKER ERROR] {worker_info_str} failed {username_str} - {end_time.strftime('%Y-%m-%d %H:%M:%S')} "
                   f"(duration: {duration_seconds:.1f}s, error: {str(e)})")
 
         return {
@@ -1125,7 +1136,11 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
 
         if debug:
             print(f"Processing {len(user_data_list)} users across Spark workers...")
-            print(f"Each worker will independently scan assigned users using DBFS API\n")
+            print(f"Each worker will independently scan assigned users using DBFS API")
+            print(f"\nUsers to be distributed:")
+            for idx, username in enumerate(usernames, 1):
+                print(f"  {idx}. {username}")
+            print()
 
         # Create DataFrame for parallel processing
         users_df = spark.createDataFrame([{"user_data": ud} for ud in user_data_list])
@@ -1143,9 +1158,44 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
         # Process in parallel using mapInPandas
         def process_users_batch(iterator):
             import pandas as pd
+            import json
+            import os
+
+            # Get worker/executor information
+            task_context = None
+            try:
+                from pyspark import TaskContext
+                task_context = TaskContext.get()
+            except:
+                pass
 
             for pdf in iterator:
                 rows = []
+                batch_users = []
+
+                # First, collect usernames in this batch for logging
+                for user_data_str in pdf['user_data']:
+                    try:
+                        data = json.loads(user_data_str)
+                        username = data.get("username", "unknown")
+                        batch_users.append(username)
+                    except:
+                        pass
+
+                # Log batch assignment if debug mode
+                if batch_users:
+                    debug_mode = False
+                    try:
+                        first_data = json.loads(pdf['user_data'].iloc[0])
+                        debug_mode = first_data.get("debug", False)
+                    except:
+                        pass
+
+                    if debug_mode:
+                        worker_id = f"Executor-{task_context.partitionId()}" if task_context else "Unknown"
+                        print(f"[WORKER BATCH] {worker_id} received {len(batch_users)} user(s): {', '.join(batch_users)}")
+
+                # Process each user in this batch
                 for user_data_str in pdf['user_data']:
                     result = process_user_on_worker(user_data_str)
                     rows.append(result)

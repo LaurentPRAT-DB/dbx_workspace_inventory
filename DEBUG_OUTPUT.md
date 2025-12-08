@@ -28,27 +28,40 @@ Connecting to cluster: 1205-132411-7d3zw4ya
 Processing 100 users across Spark workers...
 Each worker will independently scan assigned users using DBFS API
 
+Users to be distributed:
+  1. john.doe@company.com
+  2. jane.smith@company.com
+  3. alice.wong@company.com
+  4. bob.jones@company.com
+  5. carol.white@company.com
+  ...
+  100. zack.morris@company.com
+
 Distributing work to cluster workers...
 Processing users across workers (showing results as they complete)...
 
-[WORKER START] john.doe@company.com - 2025-12-07 14:30:05
-[WORKER START] jane.smith@company.com - 2025-12-07 14:30:05
-[WORKER START] alice.wong@company.com - 2025-12-07 14:30:05
-[WORKER START] bob.jones@company.com - 2025-12-07 14:30:05
-[WORKER COMPLETE] alice.wong@company.com - 2025-12-07 14:30:08 (duration: 3.2s, files: 0, size: 0)
+[WORKER BATCH] Executor-0 received 4 user(s): john.doe@company.com, jane.smith@company.com, alice.wong@company.com, bob.jones@company.com
+[WORKER BATCH] Executor-1 received 3 user(s): carol.white@company.com, dave.miller@company.com, eve.chen@company.com
+[WORKER BATCH] Executor-2 received 4 user(s): frank.wilson@company.com, grace.lee@company.com, henry.brown@company.com, iris.davis@company.com
+
+[WORKER START] Executor-0 processing john.doe@company.com - 2025-12-07 14:30:05
+[WORKER START] Executor-0 processing jane.smith@company.com - 2025-12-07 14:30:05
+[WORKER START] Executor-1 processing alice.wong@company.com - 2025-12-07 14:30:05
+[WORKER START] Executor-2 processing bob.jones@company.com - 2025-12-07 14:30:05
+[WORKER COMPLETE] Executor-1 finished alice.wong@company.com - 2025-12-07 14:30:08 (duration: 3.2s, files: 0, size: 0)
   [1/100] ⚠ alice.wong@company.com: 0 files (0 B)
-[WORKER START] carol.white@company.com - 2025-12-07 14:30:08
-[WORKER ERROR] bob.jones@company.com - 2025-12-07 14:30:10 (duration: 5.1s, error: User directory does not exist)
+[WORKER START] Executor-1 processing carol.white@company.com - 2025-12-07 14:30:08
+[WORKER ERROR] Executor-2 failed bob.jones@company.com - 2025-12-07 14:30:10 (duration: 5.1s, error: User directory does not exist)
   [2/100] ✗ bob.jones@company.com: 0 files (0 B) - User directory does not exist
-[WORKER START] dave.miller@company.com - 2025-12-07 14:30:10
-[WORKER COMPLETE] john.doe@company.com - 2025-12-07 14:30:15 (duration: 10.3s, files: 1234, size: 55234567)
+[WORKER START] Executor-2 processing dave.miller@company.com - 2025-12-07 14:30:10
+[WORKER COMPLETE] Executor-0 finished john.doe@company.com - 2025-12-07 14:30:15 (duration: 10.3s, files: 1234, size: 55234567)
   [3/100] ✓ john.doe@company.com: 1234 files (52.7 MB)
-[WORKER COMPLETE] jane.smith@company.com - 2025-12-07 14:30:16 (duration: 11.2s, files: 567, size: 25467890)
+[WORKER COMPLETE] Executor-0 finished jane.smith@company.com - 2025-12-07 14:30:16 (duration: 11.2s, files: 567, size: 25467890)
   [4/100] ✓ jane.smith@company.com: 567 files (24.2 MB)
-[WORKER COMPLETE] carol.white@company.com - 2025-12-07 14:30:18 (duration: 10.1s, files: 890, size: 39345678)
+[WORKER COMPLETE] Executor-1 finished carol.white@company.com - 2025-12-07 14:30:18 (duration: 10.1s, files: 890, size: 39345678)
   [5/100] ✓ carol.white@company.com: 890 files (37.5 MB)
   ...
-[WORKER COMPLETE] zack.morris@company.com - 2025-12-07 14:35:13 (duration: 8.7s, files: 445, size: 19876543)
+[WORKER COMPLETE] Executor-2 finished zack.morris@company.com - 2025-12-07 14:35:13 (duration: 8.7s, files: 445, size: 19876543)
   [100/100] ✓ zack.morris@company.com: 445 files (18.9 MB)
 
 Parallel processing completed in 5m 15s
@@ -101,18 +114,26 @@ When errors occur, they're shown inline:
 
 In debug mode, you also see detailed timing from **inside each worker** as it processes users:
 
-**Format:**
+**Batch Assignment Format:**
 ```
-[WORKER START] username - timestamp
-[WORKER COMPLETE] username - timestamp (duration: Xs, files: N, size: B)
-[WORKER ERROR] username - timestamp (duration: Xs, error: message)
+[WORKER BATCH] Executor-N received M user(s): user1, user2, ...
+```
+
+**Processing Format:**
+```
+[WORKER START] Executor-N processing username - timestamp
+[WORKER COMPLETE] Executor-N finished username - timestamp (duration: Xs, files: N, size: B)
+[WORKER ERROR] Executor-N failed username - timestamp (duration: Xs, error: message)
 ```
 
 **What this shows:**
-- **Parallel Execution**: Multiple `[WORKER START]` lines appearing simultaneously show workers processing users in parallel
+- **User Distribution**: `[WORKER BATCH]` messages show which users are assigned to which executor/partition
+- **Worker Identification**: Each message includes the executor ID (e.g., `Executor-0`, `Executor-1`)
+- **Parallel Execution**: Multiple `[WORKER START]` lines with different executor IDs show parallel processing
 - **Per-User Duration**: See exactly how long each user took to scan (e.g., `duration: 10.3s`)
 - **Worker Assignment**: Track which workers are busy and when they pick up new work
 - **Bottleneck Detection**: Identify users that take significantly longer to process
+- **Load Distribution**: See if work is balanced across executors or if some are idle
 
 **Example Timeline:**
 ```
