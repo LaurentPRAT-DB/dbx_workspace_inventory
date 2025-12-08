@@ -1179,7 +1179,7 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
                 results.append(result)
 
                 # Show per-user progress
-                size_str = format_bytes(result["total_size"])
+                size_str = format_size(result["total_size"])
                 status_icon = "✓" if result["status"] == "success" else ("⚠" if result["status"] == "empty" else "✗")
                 error_msg = f" - {result['error']}" if result['error'] else ""
                 print(f"  [{processed_count}/{len(usernames)}] {status_icon} {result['username']}: "
