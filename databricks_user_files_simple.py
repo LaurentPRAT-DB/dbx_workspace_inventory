@@ -687,17 +687,17 @@ Note: This accessed DBFS (Databricks File System), not Workspace files.
   Use the Workspace API method (without --cluster-id) for notebooks and workspace files."""
                 return "success", message
             else:
-                # Spark method didn't succeed, fall back to API method
+                # Spark method didn't succeed, use DBFS API method (this is expected)
                 if debug:
-                    print(f"Spark method status: {status}")
-                    print("Falling back to direct DBFS API method...")
+                    print(f"Spark /dbfs mount method status: {status}")
+                    print("Using DBFS API method instead (this is the preferred method for parallel processing)...")
 
-        # Try the direct API-based approach (no Spark or cluster needed)
+        # Try the DBFS API approach
         if debug:
             if cluster_id:
-                print("Attempting to list files via DBFS API (fallback, no cluster needed)...")
+                print("Using DBFS API method (same method used by cluster workers in parallel processing)...")
             else:
-                print("Attempting to list files via DBFS API (direct, no cluster needed)...")
+                print("Using DBFS API method (direct, no cluster required)...")
 
         file_count, total_size, status = list_user_files_via_api_direct(
             workspace_url, token, username, debug=debug
@@ -705,7 +705,37 @@ Note: This accessed DBFS (Databricks File System), not Workspace files.
 
         # If API method succeeds, return immediately
         if status == "success_api":
-            message = f"""User Information:
+            if cluster_id:
+                # Message when cluster is available
+                message = f"""User Information:
+  Username: {username}
+  Display Name: {user_display}
+  Email: {user_email}
+  Home Directory: /Users/{username}
+
+File Listing Status:
+  ✅ Successfully listed files via DBFS API
+  ✅ Using same method that cluster workers use for parallel processing
+  ✅ Direct REST API access with accurate file sizes
+
+Results:
+  Files found: {file_count}
+  Total size: {total_size:,} bytes ({total_size / (1024**3):.2f} GB)
+
+Technical Details:
+  - Connection type: Direct DBFS API
+  - Method: REST API (/api/2.0/dbfs/list)
+  - Cluster ID: {cluster_id}
+  - Parallel processing: Use --users-file with multiple users to leverage cluster workers
+  - Rate limiting: Separate quota from Workspace API
+  - Authentication: ✅ Working
+  - File system access: ✅ Working via API
+
+Note: This lists all files in DBFS under /Users/{username}
+  For parallel processing of multiple users, use --users-file option."""
+            else:
+                # Message when no cluster
+                message = f"""User Information:
   Username: {username}
   Display Name: {user_display}
   Email: {user_email}
@@ -728,7 +758,7 @@ Technical Details:
   - File system access: ✅ Working via API
 
 Note: This lists all files in DBFS under /Users/{username}
-  Including notebooks, libraries, data files, etc."""
+  For faster processing, use --cluster-id with --users-file for parallel execution."""
             return "success", message
 
         # If we get here, both methods failed (or only API method tried if no cluster_id)
@@ -1147,6 +1177,7 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
         if debug:
             print(f"Processing {len(user_data_list)} users across Spark workers...")
             print(f"Each worker will independently scan assigned users using DBFS API")
+            print(f"Method: REST API calls to /api/2.0/dbfs/list (no /dbfs mount required)")
             print(f"\nUsers to be distributed:")
             for idx, username in enumerate(usernames, 1):
                 print(f"  {idx}. {username}")

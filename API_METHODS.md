@@ -30,17 +30,18 @@ for root, dirs, files in os.walk(dbfs_path):
 
 ---
 
-### 2. Direct DBFS API (No Cluster Required)
+### 2. Direct DBFS API (Works With or Without Cluster)
 
 **How it works:**
 - Direct REST API calls to Databricks DBFS API
-- No cluster or Spark session needed
+- Can run locally (no cluster) OR distributed across cluster workers (parallel)
 - Uses `/api/2.0/dbfs/list` endpoint
 
 **Code location:** `list_user_files_via_api_direct()` (line 339+)
 
 **Requirements:**
-- ✅ Works without any cluster
+- ✅ Works without any cluster (single user)
+- ✅ Works WITH cluster for parallel processing (multiple users)
 - ✅ Works on all workspace types
 - ✅ Separate rate limit quota from Workspace API
 - ✅ Works from local machine
@@ -51,7 +52,7 @@ url = f"{workspace_url}/api/2.0/dbfs/list"
 response = requests.get(url, headers=headers, json={"path": path})
 ```
 
-**Status:** This method ALWAYS works
+**Status:** This method ALWAYS works (primary method for parallel processing!)
 
 ---
 
@@ -91,15 +92,18 @@ python databricks_user_files_simple.py user@example.com --profile PROD --cluster
 ```
 
 **Execution flow:**
-1. **Tries Method #1** (Spark Connect with /dbfs mount) - FAILS if no mount
-2. **Falls back to Method #2** (Direct DBFS API) - SUCCEEDS
+1. **Tries Method #1** (Spark Connect with /dbfs mount) - Usually FAILS (not needed)
+2. **Uses Method #2** (Direct DBFS API) - SUCCEEDS (primary method)
 
 **You see:**
 ```
-Spark method status: dbfs_mount_not_available
-Falling back to direct DBFS API method...
+Spark /dbfs mount method status: dbfs_mount_not_available
+Using DBFS API method instead (this is the preferred method for parallel processing)...
 ✅ Successfully listed files via DBFS API
+✅ Using same method that cluster workers use for parallel processing
 ```
+
+**Note:** When cluster-id is provided, DBFS API is the PRIMARY method (not a fallback)
 
 ---
 
@@ -197,20 +201,24 @@ python databricks_user_files_simple.py \
 ### Error: "dbfs_mount_not_available"
 
 **What it means:**
-- Method #1 (Spark Connect with /dbfs mount) failed
-- Normal and expected on serverless clusters
+- Method #1 (Spark Connect with /dbfs mount) is not available
+- This is normal and expected - /dbfs mount is not required
+- The DBFS API method (Method #2) is the primary method
 
 **Solution:**
-- ✅ Ignore this message - it's just a diagnostic
-- ✅ The code automatically falls back to DBFS API
-- ✅ Use parallel mode which uses DBFS API from the start
+- ✅ This is not an error - it's informational
+- ✅ The code automatically uses DBFS API (the preferred method)
+- ✅ For parallel mode, DBFS API is used directly on workers
 
 **Example:**
 ```
-Spark method status: dbfs_mount_not_available  ← Diagnostic (ignore)
-Falling back to direct DBFS API method...      ← Automatic fallback
-✅ Successfully listed files via DBFS API      ← This is what works
+Spark /dbfs mount method status: dbfs_mount_not_available  ← Informational
+Using DBFS API method instead (this is the preferred method for parallel processing)...
+✅ Successfully listed files via DBFS API      ← Primary method working
+✅ Using same method that cluster workers use for parallel processing
 ```
+
+**Important:** When you see this message with a cluster-id, it means the cluster will use DBFS API for parallel processing (which is the correct and efficient method).
 
 ---
 
