@@ -1119,6 +1119,16 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
                 .appName("Databricks User Files Parallel Processing") \
                 .remote(connect_url) \
                 .getOrCreate()
+
+            # Show cluster configuration for parallel processing insight
+            if debug:
+                try:
+                    # Get default parallelism which indicates available executor slots
+                    default_parallelism = spark.sparkContext.defaultParallelism
+                    print(f"Cluster default parallelism: {default_parallelism} (indicates ~{default_parallelism} concurrent tasks)")
+                    print(f"This means up to {default_parallelism} users can be processed simultaneously\n")
+                except:
+                    pass
         else:
             # Try to use existing session
             spark = SparkSession.builder.getOrCreate()
@@ -1144,6 +1154,17 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
 
         # Create DataFrame for parallel processing
         users_df = spark.createDataFrame([{"user_data": ud} for ud in user_data_list])
+
+        # Repartition to enable parallel processing across multiple workers
+        # Create one partition per user (up to a reasonable limit of 200)
+        # This maximizes parallelism and allows each executor to process users independently
+        num_partitions = min(len(user_data_list), 200)
+        users_df = users_df.repartition(num_partitions)
+
+        if debug:
+            actual_partitions = users_df.rdd.getNumPartitions()
+            print(f"DataFrame partitioned into {actual_partitions} partitions for parallel processing")
+            print(f"Each partition will be processed by a different executor\n")
 
         # Define output schema
         output_schema = StructType([
