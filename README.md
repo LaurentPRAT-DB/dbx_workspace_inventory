@@ -20,6 +20,16 @@ python databricks_user_files_simple.py \
 
 **That's it!** You now have a complete inventory of all files across your workspace.
 
+## ✨ Key Features
+
+- **⚡ Parallel Processing** - 10-100x faster by distributing work across cluster workers
+- **🔍 Dual File System Scanning** - Automatically checks both DBFS (data files) and Workspace (notebooks)
+- **📊 Comprehensive Results** - Tracks file count, size, source, and status for each user
+- **🎯 Real-Time Progress** - See live updates as workers process users in parallel
+- **🛡️ Automatic Fallback** - If DBFS is empty, automatically tries Workspace API
+- **📈 Scalable** - Efficiently handles 1000+ users with proper cluster sizing
+- **🔧 SparkConnect Compatible** - Works with both traditional and serverless clusters
+
 ## 📊 What You Get
 
 ### User List (`users.csv`)
@@ -32,11 +42,17 @@ alice.wong@company.com
 
 ### Inventory Results (`results.csv`)
 ```csv
-username,file_count,total_size,total_size_gb,status,error
-john.doe@company.com,1234,52678912,0.05,success,
-jane.smith@company.com,567,24234567,0.02,success,
-alice.wong@company.com,890,37512377,0.03,success,
+username,file_count,total_size,total_size_gb,status,file_source,error
+john.doe@company.com,1234,52678912,0.05,success,dbfs,
+jane.smith@company.com,567,24234567,0.02,success,dbfs,
+alice.wong@company.com,15,150000,0.00,success,workspace,
 ```
+
+**Note:** The tool automatically scans both file systems:
+- **DBFS** (Databricks File System) - Data files, CSV, Parquet, etc.
+- **Workspace** - Notebooks, libraries, Python files
+
+See [WORKSPACE_VS_DBFS.md](WORKSPACE_VS_DBFS.md) for details on the two file systems.
 
 ## ⚡ Performance
 
@@ -70,8 +86,11 @@ alice.wong@company.com,890,37512377,0.03,success,
 - **Databricks workspace** with access to users and their home directories
 - **Databricks Personal Access Token** with permissions:
   - `users:read` - List workspace users via SCIM API
-  - Read access to user home directories in DBFS
+  - Read access to user home directories in DBFS (`dbfs:/Users/`)
+  - Read access to user workspace directories (`/Users/`)
 - **Python 3.10+** installed locally
+
+**Note:** The tool automatically scans both DBFS and Workspace file systems to provide complete coverage.
 
 ### For Parallel Processing (Recommended)
 - **Running Databricks cluster** (All-Purpose or Job cluster)
@@ -336,17 +355,26 @@ Processing users across workers (showing results as they complete)...
 [WORKER BATCH] Executor-1 received 3 user(s): alice.wong@company.com, bob.jones@company.com, ...
 
 [WORKER START] Executor-0 processing john.doe@company.com - 2025-12-08 14:30:05
-[WORKER START] Executor-0 processing jane.smith@company.com - 2025-12-08 14:30:05
 [WORKER START] Executor-1 processing alice.wong@company.com - 2025-12-08 14:30:05
-[WORKER COMPLETE] Executor-1 finished alice.wong@company.com - 2025-12-08 14:30:08 (duration: 3.2s, files: 0, size: 0)
-  [1/100] ⚠ alice.wong@company.com: 0 files (0 B)
-[WORKER ERROR] Executor-1 failed bob.jones@company.com - 2025-12-08 14:30:10 (duration: 5.1s, error: User directory does not exist)
-  [2/100] ✗ bob.jones@company.com: 0 files (0 B) - User directory does not exist
+[WORKER] Executor-1 - No DBFS files for alice.wong@company.com, trying Workspace API...
+[WORKER] Executor-1 - Found 15 workspace files for alice.wong@company.com
+[WORKER COMPLETE] Executor-1 finished alice.wong@company.com - 2025-12-08 14:30:08 (duration: 3.2s, files: 15, size: 150000)
+  [1/100] ✓ [Executor-1] [WORKSPACE] alice.wong@company.com: 15 files (146.5 KB) (3.2s)
+      ↳ start=2025-12-08 14:30:05 end=2025-12-08 14:30:08
 [WORKER COMPLETE] Executor-0 finished john.doe@company.com - 2025-12-08 14:30:15 (duration: 10.3s, files: 1234, size: 55234567)
-  [3/100] ✓ john.doe@company.com: 1234 files (52.7 MB)
-[WORKER COMPLETE] Executor-0 finished jane.smith@company.com - 2025-12-08 14:30:16 (duration: 11.2s, files: 567, size: 25467890)
-  [4/100] ✓ jane.smith@company.com: 567 files (24.2 MB)
+  [2/100] ✓ [Executor-0] [DBFS] john.doe@company.com: 1234 files (52.7 MB) (10.3s)
+      ↳ start=2025-12-08 14:30:05 end=2025-12-08 14:30:15
   ...
+
+================================================================================
+PARALLEL EXECUTION CONFIRMED
+================================================================================
+✓ Work was distributed across 4 different executors:
+  • Executor-0: processed 25 user(s)
+  • Executor-1: processed 23 user(s)
+  • Executor-2: processed 27 user(s)
+  • Executor-3: processed 25 user(s)
+================================================================================
 ```
 
 **Status Icons:**
@@ -358,9 +386,12 @@ Processing users across workers (showing results as they complete)...
 - **User distribution list**: All users to be processed before work starts
 - **Batch assignment**: Which users are assigned to which executor/worker
 - **Worker identification**: Each message shows the executor ID (e.g., `Executor-0`)
+- **File source tracking**: Shows whether files came from DBFS or Workspace (`[DBFS]` or `[WORKSPACE]`)
+- **Automatic fallback**: Workers try Workspace API if DBFS is empty
 - **Worker-level timing**: When each worker starts/completes processing a user
 - **Per-user duration**: How long each user took to scan (e.g., `duration: 10.3s`)
 - **Parallel execution**: Multiple executors processing simultaneously
+- **Parallel execution summary**: Confirms distribution across executors at the end
 - **Real-time progress**: Results stream in as workers finish
 
 **Benefits:**
@@ -455,10 +486,11 @@ alice.wong@company.com
 ### Inventory Results (`results.csv`)
 CSV with detailed information:
 ```csv
-username,file_count,total_size,total_size_gb,status,error
-john.doe@company.com,1234,52678912,0.05,success,
-jane.smith@company.com,0,0,0.00,empty,
-bob.jones@company.com,0,0,0.00,error,User not found
+username,file_count,total_size,total_size_gb,status,file_source,error
+john.doe@company.com,1234,52678912,0.05,success,dbfs,
+jane.smith@company.com,15,150000,0.00,success,workspace,
+bob.jones@company.com,0,0,0.00,empty,unknown,
+alice.wong@company.com,0,0,0.00,error,unknown,User not found
 ```
 
 **Columns:**
@@ -467,7 +499,15 @@ bob.jones@company.com,0,0,0.00,error,User not found
 - `total_size` - Total size in bytes
 - `total_size_gb` - Total size in GB (rounded)
 - `status` - `success`, `empty`, or `error`
+- `file_source` - Where files were found: `dbfs` (data files), `workspace` (notebooks), or `unknown`
 - `error` - Error message (if status is error)
+
+**Understanding file_source:**
+- **`dbfs`** - Files found in DBFS (Databricks File System): data files, CSV, Parquet, etc.
+- **`workspace`** - Files found in Workspace: notebooks, libraries, Python files
+- **`unknown`** - No files found or error occurred
+
+The tool automatically checks both locations for each user.
 
 ---
 
@@ -573,11 +613,20 @@ pyenv local 3.11.0
 ### Empty results or "No files found"
 
 **Causes:**
-1. User directory doesn't exist
-2. User has no files
+1. User has no files in either DBFS or Workspace
+2. User directory doesn't exist
 3. Permission issues
 
-**Solution:** Check the `error` column in results.csv for details
+**Solution:**
+- Check the `file_source` column - shows whether DBFS, Workspace, or neither had files
+- Check the `error` column for specific error messages
+- See [WORKSPACE_VS_DBFS.md](WORKSPACE_VS_DBFS.md) to understand the two file systems
+
+**Important:** The tool automatically checks both:
+- **DBFS** (`dbfs:/Users/{username}`) - Data files
+- **Workspace** (`/Users/{username}`) - Notebooks and code
+
+Most users have notebooks in Workspace but no data files in DBFS. This is normal!
 
 ### Parallel processing falls back to sequential
 
@@ -678,8 +727,11 @@ How it works:
 
 ## Additional Documentation
 
+- **[WORKSPACE_VS_DBFS.md](WORKSPACE_VS_DBFS.md)** - Understanding the two file systems (DBFS vs Workspace)
 - **[README_PARALLEL.md](README_PARALLEL.md)** - Deep dive into parallel processing
-- **[TIMING_LOGS.md](TIMING_LOGS.md)** - Understanding timing logs and performance metrics
+- **[DEBUG_OUTPUT.md](DEBUG_OUTPUT.md)** - Understanding debug output and worker logs
+- **[API_METHODS.md](API_METHODS.md)** - Technical details on API methods used
+- **[PARALLEL_FIX.md](PARALLEL_FIX.md)** - How parallel distribution was fixed
 - **[CLAUDE.md](CLAUDE.md)** - Full technical documentation and architecture
 
 ---

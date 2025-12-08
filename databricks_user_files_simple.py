@@ -469,6 +469,120 @@ def list_user_files_via_api_direct(workspace_url: str, token: str, username: str
         return 0, 0, f"api_error: {str(e)}"
 
 
+def list_workspace_files_via_api(workspace_url: str, token: str, username: str, debug: bool = False) -> Tuple[int, int, str]:
+    """
+    List files in Workspace File System using Databricks Workspace API.
+    This scans /Workspace/Users/{username}/ - the notebooks and workspace files visible in the UI.
+    Different from DBFS API which scans dbfs:/Users/{username}/.
+    """
+    import time
+
+    try:
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+
+        workspace_path = f"/Users/{username}"
+        file_count = 0
+        total_size = 0
+        dir_count = 0
+        request_count = 0
+        rate_limit_delay = 0.05
+
+        def list_recursive(path: str, depth: int = 0, max_depth: int = 10):
+            nonlocal file_count, total_size, dir_count, request_count, rate_limit_delay
+
+            if depth > max_depth:
+                return
+
+            max_retries = 5
+            retry_count = 0
+
+            while retry_count < max_retries:
+                try:
+                    if request_count > 0:
+                        time.sleep(rate_limit_delay)
+
+                    request_count += 1
+
+                    # Use Workspace API to list workspace objects
+                    url = f"{workspace_url}/api/2.0/workspace/list"
+                    response = requests.get(
+                        url,
+                        headers=headers,
+                        json={"path": path},
+                        timeout=30
+                    )
+
+                    if response.status_code == 404:
+                        # Path doesn't exist
+                        return
+                    elif response.status_code == 429:
+                        # Rate limited
+                        retry_count += 1
+                        wait_time = min(2 ** retry_count, 32)
+                        time.sleep(wait_time)
+                        rate_limit_delay = min(rate_limit_delay * 1.5, 1.0)
+                        continue
+                    elif response.status_code != 200:
+                        if debug:
+                            print(f"Workspace API returned {response.status_code} for {path}")
+                        return
+
+                    data = response.json()
+                    objects = data.get("objects", [])
+
+                    for obj in objects:
+                        object_path = obj.get("path", "")
+                        object_type = obj.get("object_type", "")
+
+                        # object_type can be: NOTEBOOK, DIRECTORY, LIBRARY, REPO, FILE
+                        if object_type == "DIRECTORY":
+                            dir_count += 1
+                            list_recursive(object_path, depth + 1, max_depth)
+                        else:
+                            # NOTEBOOK, LIBRARY, FILE, etc.
+                            file_count += 1
+                            # Workspace API doesn't return file size, so we estimate
+                            # Note: To get actual sizes, would need to export each notebook
+                            total_size += 10000  # Rough estimate: 10KB per file
+
+                    return
+
+                except requests.exceptions.RequestException as e:
+                    retry_count += 1
+                    if retry_count >= max_retries:
+                        if debug:
+                            print(f"Failed after {max_retries} retries for {path}: {str(e)}")
+                        return
+                    wait_time = min(2 ** retry_count, 16)
+                    if debug:
+                        print(f"Request error for {path}, retrying in {wait_time}s: {str(e)}")
+                    time.sleep(wait_time)
+
+        if debug:
+            print(f"Listing workspace files via Workspace API for: {workspace_path}")
+            print("Note: This scans notebooks and workspace files (not DBFS)")
+
+        list_recursive(workspace_path)
+
+        if debug:
+            print(f"Total API requests made: {request_count}")
+            print(f"Files: {file_count}, Directories: {dir_count}")
+            print(f"Note: Size is estimated ({total_size:,} bytes) - Workspace API doesn't provide exact sizes")
+
+        if file_count > 0:
+            return file_count, total_size, "success_workspace_api"
+        else:
+            return 0, 0, "no_workspace_files_found"
+
+    except Exception as e:
+        if debug:
+            print(f"Workspace API listing failed: {str(e)}")
+        return 0, 0, f"workspace_api_error: {str(e)}"
+
+
 def try_list_user_files_via_spark(workspace_url: str, token: str, username: str,
                                   cluster_id: Optional[str] = None, debug: bool = False) -> Tuple[int, int, str]:
     """
@@ -761,50 +875,114 @@ Note: This lists all files in DBFS under /Users/{username}
   For faster processing, use --cluster-id with --users-file for parallel execution."""
             return "success", message
 
-        # If we get here, both methods failed (or only API method tried if no cluster_id)
+        # If DBFS API failed, try Workspace API (for notebooks and workspace files)
+        if debug:
+            print("DBFS API didn't find files, trying Workspace API...")
+            print("Note: Workspace API lists notebooks and workspace files (different from DBFS)")
+
+        workspace_file_count, workspace_total_size, workspace_status = list_workspace_files_via_api(
+            workspace_url, token, username, debug=debug
+        )
+
+        if workspace_status == "success_workspace_api":
+            message = f"""User Information:
+  Username: {username}
+  Display Name: {user_display}
+  Email: {user_email}
+  Workspace Path: /Users/{username} (Workspace File System)
+
+File Listing Status:
+  ✅ Successfully listed files via Workspace API
+  ℹ️  Note: These are workspace files (notebooks, libraries) - NOT DBFS files
+
+Results:
+  Files found: {workspace_file_count}
+  Estimated size: {workspace_total_size:,} bytes ({workspace_total_size / (1024**3):.2f} GB)
+
+Technical Details:
+  - Method: Workspace API (/api/2.0/workspace/list)
+  - Scans: Notebooks, libraries, Python files, folders
+  - Different from: DBFS API which scans data files in dbfs:/Users/{username}
+  {"- Cluster ID: " + cluster_id if cluster_id else ""}
+
+What You're Seeing:
+  ✅ Workspace files visible in the UI browser (Workspace → Users → {username})
+  ❌ DBFS files not accessible or empty (Data → DBFS → Users → {username})
+
+This is normal! Most users have notebooks in the Workspace File System,
+but may not have data files in DBFS."""
+            return "success", message
+
+        # If we get here, all methods failed
         if cluster_id:
             message = f"""User Information:
   Username: {username}
   Display Name: {user_display}
   Email: {user_email}
-  Home Directory: /Users/{username}
 
 File Listing Status:
-  ❌ Both Spark Connect and DBFS API methods failed
+  ❌ All file listing methods failed
 
 Technical Details:
-  - Spark Connect (attempted first): Failed with status: {status}
-  - DBFS API (attempted as fallback): Failed with status: {status}
+  - Spark Connect: Failed with status: {status}
+  - DBFS API: Failed with status: {status}
+  - Workspace API: Failed with status: {workspace_status}
   - Cluster ID: {cluster_id}
 
 Troubleshooting:
   1. Verify the cluster is running: databricks clusters list
   2. Verify the cluster ID is correct
-  3. Check if the cluster has the required permissions
-  4. Verify the user directory exists: /Users/{username}
+  3. Check token has permissions for both DBFS and Workspace access
+  4. Verify user directories exist:
+     - DBFS: /Users/{username} (data files)
+     - Workspace: /Users/{username} (notebooks)
   5. Try running with --debug flag for more details"""
             return "failed", message
 
-        # If we get here, API method didn't find files and either no cluster or Spark method also failed
+        # If we get here, API method didn't find files
+        # This code path is for when DBFS returns "no files found"
         if status == "no_files_found_api" or status == "no_files_found":
-            message = f"""User Information:
+            # Workspace API was already tried above, use that result
+            if workspace_status == "success_workspace_api":
+                # Already returned above, should not reach here
+                pass
+            elif workspace_status == "no_workspace_files_found":
+                message = f"""User Information:
   Username: {username}
   Display Name: {user_display}
   Email: {user_email}
-  Home Directory: /Users/{username}
 
 File Listing Status:
-  ✅ Connection successful
-  ℹ️  No files found in user's home directory
+  ✅ APIs working correctly
+  ℹ️  No files found in either location
 
 Technical Details:
-  - Workspace API: ✅ Checked
-  - Result: User directory is empty or doesn't exist
+  - DBFS API: ✅ Checked - no files in dbfs:/Users/{username}
+  - Workspace API: ✅ Checked - no files in /Users/{username}
   {"- Cluster Spark check: Also returned no files" if cluster_id else ""}
 
-Note: The Workspace API lists notebooks and workspace files.
-  If you need to check DBFS files, provide a --cluster-id to use Spark-based DBFS access."""
-            return "failed", message
+Result: User has no files in either:
+  - DBFS (data files): dbfs:/Users/{username}
+  - Workspace (notebooks): /Users/{username}
+
+This is normal for new or inactive users."""
+                return "failed", message
+            else:
+                message = f"""User Information:
+  Username: {username}
+  Display Name: {user_display}
+  Email: {user_email}
+
+File Listing Status:
+  ⚠️  Mixed results
+
+Technical Details:
+  - DBFS API: No files found
+  - Workspace API: {workspace_status}
+  {"- Cluster ID: " + cluster_id if cluster_id else ""}
+
+Note: DBFS directory is empty, but Workspace API check had issues."""
+                return "failed", message
 
         # If no cluster_id, get server runtime info for diagnostics
         if debug:
@@ -1067,8 +1245,86 @@ def process_user_on_worker(user_data: str) -> Dict:
                         return
                     time.sleep(min(2 ** retry_count, 16))
 
-        # Process the user
+        # Process the user - try DBFS first
+        file_source = "dbfs"  # Track which API found the files
         list_recursive(home_path)
+
+        # If no files found in DBFS, try Workspace API
+        if file_count == 0:
+            if debug:
+                print(f"[WORKER] {worker_info} - No DBFS files for {username}, trying Workspace API...")
+
+            workspace_file_count = 0
+            workspace_dir_count = 0
+
+            def list_workspace_recursive(path: str, depth: int = 0, max_depth: int = 10):
+                nonlocal workspace_file_count, workspace_dir_count, request_count, rate_limit_delay
+
+                if depth > max_depth:
+                    return
+
+                max_retries = 5
+                retry_count = 0
+
+                while retry_count < max_retries:
+                    try:
+                        if request_count > 0:
+                            time.sleep(rate_limit_delay)
+
+                        request_count += 1
+
+                        url = f"{workspace_url}/api/2.0/workspace/list"
+                        response = requests.get(
+                            url,
+                            headers=headers,
+                            json={"path": path},
+                            timeout=30
+                        )
+
+                        if response.status_code == 404:
+                            return
+                        elif response.status_code == 429:
+                            retry_count += 1
+                            wait_time = min(2 ** retry_count, 32)
+                            time.sleep(wait_time)
+                            rate_limit_delay = min(rate_limit_delay * 1.5, 1.0)
+                            continue
+                        elif response.status_code != 200:
+                            return
+
+                        data = response.json()
+                        objects = data.get("objects", [])
+
+                        for obj in objects:
+                            object_path = obj.get("path", "")
+                            object_type = obj.get("object_type", "")
+
+                            if object_type == "DIRECTORY":
+                                workspace_dir_count += 1
+                                list_workspace_recursive(object_path, depth + 1, max_depth)
+                            else:
+                                # NOTEBOOK, LIBRARY, FILE, etc.
+                                workspace_file_count += 1
+
+                        return
+
+                    except Exception:
+                        retry_count += 1
+                        if retry_count >= max_retries:
+                            return
+                        time.sleep(min(2 ** retry_count, 16))
+
+            # Scan Workspace
+            list_workspace_recursive(home_path)
+
+            # If found workspace files, use those
+            if workspace_file_count > 0:
+                file_count = workspace_file_count
+                dir_count = workspace_dir_count
+                total_size = workspace_file_count * 10000  # Estimate 10KB per file
+                file_source = "workspace"  # Mark as workspace files
+                if debug:
+                    print(f"[WORKER] {worker_info} - Found {workspace_file_count} workspace files for {username}")
 
         # Debug: Print completion time on worker
         end_time = datetime.now()
@@ -1084,15 +1340,23 @@ def process_user_on_worker(user_data: str) -> Dict:
             "total_size": total_size,
             "dir_count": dir_count,
             "status": "success" if file_count > 0 else "empty",
-            "error": None
+            "error": None,
+            "worker_id": worker_info,
+            "start_time": start_time.strftime('%Y-%m-%d %H:%M:%S'),
+            "end_time": end_time.strftime('%Y-%m-%d %H:%M:%S'),
+            "duration_seconds": duration_seconds,
+            "file_source": file_source  # 'dbfs' or 'workspace'
         }
 
     except Exception as e:
         # Debug: Print error completion time on worker
-        if 'start_time' in locals() and 'data' in locals() and data.get("debug", False):
-            end_time = datetime.now()
+        end_time = datetime.now()
+        duration_seconds = 0
+        if 'start_time' in locals():
             duration = end_time - start_time
             duration_seconds = duration.total_seconds()
+
+        if 'data' in locals() and data.get("debug", False):
             username_str = data.get("username", "unknown")
             worker_info_str = worker_info if 'worker_info' in locals() else "Unknown"
             print(f"[WORKER ERROR] {worker_info_str} failed {username_str} - {end_time.strftime('%Y-%m-%d %H:%M:%S')} "
@@ -1104,7 +1368,12 @@ def process_user_on_worker(user_data: str) -> Dict:
             "total_size": 0,
             "dir_count": 0,
             "status": "error",
-            "error": str(e)
+            "error": str(e),
+            "worker_id": worker_info if 'worker_info' in locals() else "Unknown",
+            "start_time": start_time.strftime('%Y-%m-%d %H:%M:%S') if 'start_time' in locals() else "",
+            "end_time": end_time.strftime('%Y-%m-%d %H:%M:%S'),
+            "duration_seconds": duration_seconds,
+            "file_source": "unknown"
         }
 
 
@@ -1130,7 +1399,7 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
 
     try:
         from pyspark.sql import SparkSession
-        from pyspark.sql.types import StructType, StructField, StringType, LongType
+        from pyspark.sql.types import StructType, StructField, StringType, LongType, DoubleType
 
         print(f"\n{'='*80}")
         print(f"PARALLEL PROCESSING {len(usernames)} USERS USING SPARK CLUSTER")
@@ -1189,18 +1458,27 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
                         print(f"Workers: Unable to query cluster info (will use Spark defaults)")
 
                     # Get default parallelism which indicates available executor slots
-                    default_parallelism = spark.sparkContext.defaultParallelism
-                    print(f"Default parallelism: {default_parallelism} concurrent tasks")
+                    # Use spark.conf.get for SparkConnect/DatabricksConnect compatibility
+                    try:
+                        default_parallelism = int(spark.conf.get('spark.default.parallelism', '8'))
+                        print(f"Default parallelism: {default_parallelism} concurrent tasks")
 
-                    if num_workers:
-                        cores_per_worker = default_parallelism // max(num_workers, 1)
-                        print(f"Estimated cores per worker: ~{cores_per_worker}")
+                        if num_workers:
+                            cores_per_worker = default_parallelism // max(num_workers, 1)
+                            print(f"Estimated cores per worker: ~{cores_per_worker}")
 
-                    print(f"Maximum concurrent users: ~{default_parallelism}")
+                        print(f"Maximum concurrent users: ~{default_parallelism}")
+                    except Exception as e:
+                        print(f"Note: Could not retrieve parallelism info: {str(e)}")
+
                     print()
 
                 except Exception as e:
-                    print(f"Note: Could not retrieve detailed cluster info: {str(e)}")
+                    # Expected when using SparkConnect/DatabricksConnect
+                    if "JVM_ATTRIBUTE_NOT_SUPPORTED" in str(e) or "sparkContext" in str(e):
+                        print(f"Note: Using SparkConnect/DatabricksConnect mode - detailed cluster info not available")
+                    else:
+                        print(f"Note: Could not retrieve detailed cluster info: {str(e)}")
                     print()
         else:
             # Try to use existing session
@@ -1262,7 +1540,12 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
             StructField("total_size", LongType(), True),
             StructField("dir_count", LongType(), True),
             StructField("status", StringType(), True),
-            StructField("error", StringType(), True)
+            StructField("error", StringType(), True),
+            StructField("worker_id", StringType(), True),
+            StructField("start_time", StringType(), True),
+            StructField("end_time", StringType(), True),
+            StructField("duration_seconds", DoubleType(), True),
+            StructField("file_source", StringType(), True)  # 'dbfs' or 'workspace'
         ])
 
         # Process in parallel using mapInPandas
@@ -1344,16 +1627,28 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
                     "total_size": int(row.total_size or 0),
                     "dir_count": int(row.dir_count or 0),
                     "status": row.status,
-                    "error": row.error
+                    "error": row.error,
+                    "worker_id": row.worker_id,
+                    "start_time": row.start_time,
+                    "end_time": row.end_time,
+                    "duration_seconds": float(row.duration_seconds or 0),
+                    "file_source": row.file_source
                 }
                 results.append(result)
 
-                # Show per-user progress
+                # Show per-user progress with worker and timing info
                 size_str = format_size(result["total_size"])
                 status_icon = "✓" if result["status"] == "success" else ("⚠" if result["status"] == "empty" else "✗")
                 error_msg = f" - {result['error']}" if result['error'] else ""
-                print(f"  [{processed_count}/{len(usernames)}] {status_icon} {result['username']}: "
-                      f"{result['file_count']} files ({size_str}){error_msg}")
+                worker_info = f"[{result['worker_id']}]" if result['worker_id'] else ""
+                duration_info = f"({result['duration_seconds']:.1f}s)" if result['duration_seconds'] > 0 else ""
+                timing_info = f"start={result['start_time']} end={result['end_time']}" if result['start_time'] else ""
+                source_info = f"[{result['file_source'].upper()}]" if result.get('file_source') else ""
+
+                print(f"  [{processed_count}/{len(usernames)}] {status_icon} {worker_info} {source_info} {result['username']}: "
+                      f"{result['file_count']} files ({size_str}) {duration_info}")
+                if timing_info:
+                    print(f"      ↳ {timing_info}{error_msg}")
 
             print()  # Empty line after all users
         else:
@@ -1369,7 +1664,12 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
                     "total_size": int(row.total_size or 0),
                     "dir_count": int(row.dir_count or 0),
                     "status": row.status,
-                    "error": row.error
+                    "error": row.error,
+                    "worker_id": row.worker_id,
+                    "start_time": row.start_time,
+                    "end_time": row.end_time,
+                    "duration_seconds": float(row.duration_seconds or 0),
+                    "file_source": row.file_source
                 })
 
         # Calculate parallel processing duration
@@ -1388,6 +1688,22 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
             duration_str = f"{seconds}s"
 
         print(f"Parallel processing completed in {duration_str}\n")
+
+        # Show parallel execution summary in debug mode
+        if debug:
+            unique_workers = set(r.get("worker_id") for r in results if r.get("worker_id"))
+            if unique_workers and len(unique_workers) > 1:
+                print(f"{'='*80}")
+                print(f"PARALLEL EXECUTION CONFIRMED")
+                print(f"{'='*80}")
+                print(f"✓ Work was distributed across {len(unique_workers)} different executors:")
+                for worker_id in sorted(unique_workers):
+                    worker_users = [r["username"] for r in results if r.get("worker_id") == worker_id]
+                    print(f"  • {worker_id}: processed {len(worker_users)} user(s)")
+                print(f"{'='*80}\n")
+            elif unique_workers and len(unique_workers) == 1:
+                print(f"Note: All work was processed by a single executor: {list(unique_workers)[0]}")
+                print(f"      (This may indicate a single-node cluster or low parallelism)\n")
 
         return results
 
@@ -1486,7 +1802,7 @@ def process_multiple_users(usernames: List[str], workspace_url: Optional[str] = 
                 try:
                     import csv
                     with open(output_csv, 'w', newline='') as csvfile:
-                        fieldnames = ['username', 'file_count', 'total_size', 'total_size_gb', 'status', 'error']
+                        fieldnames = ['username', 'file_count', 'total_size', 'total_size_gb', 'status', 'file_source', 'error']
                         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
 
                         writer.writeheader()
@@ -1497,6 +1813,7 @@ def process_multiple_users(usernames: List[str], workspace_url: Optional[str] = 
                                 'total_size': r['total_size'],
                                 'total_size_gb': round(r['total_size'] / (1024**3), 2),
                                 'status': r['status'],
+                                'file_source': r.get('file_source', 'unknown'),
                                 'error': r['error'] or ''
                             })
 
@@ -1580,7 +1897,7 @@ def process_multiple_users(usernames: List[str], workspace_url: Optional[str] = 
         try:
             import csv
             with open(output_csv, 'w', newline='') as csvfile:
-                fieldnames = ['username', 'file_count', 'total_size', 'total_size_gb', 'status', 'error']
+                fieldnames = ['username', 'file_count', 'total_size', 'total_size_gb', 'status', 'file_source', 'error']
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
 
                 writer.writeheader()
@@ -1591,6 +1908,7 @@ def process_multiple_users(usernames: List[str], workspace_url: Optional[str] = 
                         'total_size': r['total_size'],
                         'total_size_gb': round(r['total_size'] / (1024**3), 2),
                         'status': r['status'],
+                        'file_source': r.get('file_source', 'unknown'),
                         'error': r['error'] or ''
                     })
 

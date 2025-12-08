@@ -2,8 +2,9 @@
 # Lines starting with # are comments and will be ignored
 # One email address per line
 
+brian.brown@databricks.com
 laurent.prat@databricks.com
-quentin.ambard@databricks.com
+
 
 
 # You can add more users below
