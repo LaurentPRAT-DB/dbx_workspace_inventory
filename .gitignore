@@ -60,3 +60,5 @@ Thumbs.db
 user_email*
 user_*
 results_*
+# Checkpoint files
+.checkpoint_progress.json
