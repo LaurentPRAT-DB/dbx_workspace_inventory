@@ -806,19 +806,47 @@ Note: This accessed DBFS (Databricks File System), not Workspace files.
                     print(f"Spark /dbfs mount method status: {status}")
                     print("Using DBFS API method instead (this is the preferred method for parallel processing)...")
 
-        # Try the DBFS API approach
+        # Try the DBFS API approach (always scan)
         if debug:
             if cluster_id:
-                print("Using DBFS API method (same method used by cluster workers in parallel processing)...")
+                print("[DBFS] Using DBFS API method (same method used by cluster workers in parallel processing)...")
             else:
-                print("Using DBFS API method (direct, no cluster required)...")
+                print("[DBFS] Using DBFS API method (direct, no cluster required)...")
 
-        file_count, total_size, status = list_user_files_via_api_direct(
+        dbfs_file_count, dbfs_total_size, dbfs_status = list_user_files_via_api_direct(
             workspace_url, token, username, debug=debug
         )
 
-        # If API method succeeds, return immediately
-        if status == "success_api":
+        # Try Workspace API (always scan, not just fallback)
+        if debug:
+            print("[WORKSPACE] Scanning workspace files (notebooks, libraries)...")
+
+        workspace_file_count, workspace_total_size, workspace_status = list_workspace_files_via_api(
+            workspace_url, token, username, debug=debug
+        )
+
+        # Cumulate results from both sources
+        combined_file_count = 0
+        combined_total_size = 0
+        sources_found = []
+
+        if dbfs_status == "success_api":
+            combined_file_count += dbfs_file_count
+            combined_total_size += dbfs_total_size
+            sources_found.append("DBFS")
+            if debug:
+                print(f"[DBFS] Found {dbfs_file_count} files ({dbfs_total_size:,} bytes)")
+
+        if workspace_status == "success_workspace_api":
+            combined_file_count += workspace_file_count
+            combined_total_size += workspace_total_size
+            sources_found.append("Workspace")
+            if debug:
+                print(f"[WORKSPACE] Found {workspace_file_count} files ({workspace_total_size:,} bytes)")
+
+        # Return success if we found files in either or both sources
+        if combined_file_count > 0:
+            sources_str = " + ".join(sources_found)
             if cluster_id:
                 # Message when cluster is available
                 message = f"""User Information:
@@ -828,25 +856,22 @@ Note: This accessed DBFS (Databricks File System), not Workspace files.
   Home Directory: /Users/{username}
 
 File Listing Status:
-  ✅ Successfully listed files via DBFS API
-  ✅ Using same method that cluster workers use for parallel processing
-  ✅ Direct REST API access with accurate file sizes
+  ✅ Successfully scanned both file systems
+  {"✅ DBFS: " + str(dbfs_file_count) + " files" if "DBFS" in sources_found else "⊘ DBFS: No files"}
+  {"✅ Workspace: " + str(workspace_file_count) + " files (notebooks/libraries)" if "Workspace" in sources_found else "⊘ Workspace: No files"}
 
-Results:
-  Files found: {file_count}
-  Total size: {total_size:,} bytes ({total_size / (1024**3):.2f} GB)
+Combined Results:
+  Total files: {combined_file_count:,} (from {sources_str})
+  Total size: {combined_total_size:,} bytes ({combined_total_size / (1024**3):.2f} GB)
 
 Technical Details:
-  - Connection type: Direct DBFS API
-  - Method: REST API (/api/2.0/dbfs/list)
+  - Scanned: Both DBFS (data files) and Workspace (notebooks)
+  - DBFS API: /api/2.0/dbfs/list
+  - Workspace API: /api/2.0/workspace/list
   - Cluster ID: {cluster_id}
   - Parallel processing: Use --users-file with multiple users to leverage cluster workers
-  - Rate limiting: Separate quota from Workspace API
-  - Authentication: ✅ Working
-  - File system access: ✅ Working via API
 
-Note: This lists all files in DBFS under /Users/{username}
-  For parallel processing of multiple users, use --users-file option."""
+Note: This provides a complete inventory by scanning both file systems."""
             else:
                 # Message when no cluster
                 message = f"""User Information:
@@ -856,133 +881,73 @@ Note: This lists all files in DBFS under /Users/{username}
   Home Directory: /Users/{username}
 
 File Listing Status:
-  ✅ Successfully listed files via DBFS API
-  ✅ No cluster or Spark session required
-  ✅ Direct REST API access with accurate file sizes
+  ✅ Successfully scanned both file systems
+  {"✅ DBFS: " + str(dbfs_file_count) + " files" if "DBFS" in sources_found else "⊘ DBFS: No files"}
+  {"✅ Workspace: " + str(workspace_file_count) + " files (notebooks/libraries)" if "Workspace" in sources_found else "⊘ Workspace: No files"}
 
-Results:
-  Files found: {file_count}
-  Total size: {total_size:,} bytes ({total_size / (1024**3):.2f} GB)
+Combined Results:
+  Total files: {combined_file_count:,} (from {sources_str})
+  Total size: {combined_total_size:,} bytes ({combined_total_size / (1024**3):.2f} GB)
 
 Technical Details:
-  - Connection type: Direct DBFS API
-  - Method: REST API (/api/2.0/dbfs/list)
-  - Rate limiting: Separate quota from Workspace API
-  - Authentication: ✅ Working
-  - File system access: ✅ Working via API
+  - Scanned: Both DBFS (data files) and Workspace (notebooks)
+  - DBFS API: /api/2.0/dbfs/list
+  - Workspace API: /api/2.0/workspace/list
+  - No cluster required
 
-Note: This lists all files in DBFS under /Users/{username}
-  For faster processing, use --cluster-id with --users-file for parallel execution."""
+Note: This provides a complete inventory by scanning both file systems.
+  For faster processing of many users, use --cluster-id with --users-file for parallel execution."""
             return "success", message
 
-        # If DBFS API failed, try Workspace API (for notebooks and workspace files)
-        if debug:
-            print("DBFS API didn't find files, trying Workspace API...")
-            print("Note: Workspace API lists notebooks and workspace files (different from DBFS)")
+        # If we get here, no files were found in either source
+        # Check if both APIs worked but found no files, or if APIs failed
+        both_apis_checked = (dbfs_status in ["success_api", "no_files_found_api"]) and \
+                           (workspace_status in ["success_workspace_api", "no_workspace_files_found"])
 
-        workspace_file_count, workspace_total_size, workspace_status = list_workspace_files_via_api(
-            workspace_url, token, username, debug=debug
-        )
-
-        if workspace_status == "success_workspace_api":
+        if both_apis_checked:
+            # APIs worked, just no files found
             message = f"""User Information:
-  Username: {username}
-  Display Name: {user_display}
-  Email: {user_email}
-  Workspace Path: /Users/{username} (Workspace File System)
-
-File Listing Status:
-  ✅ Successfully listed files via Workspace API
-  ℹ️  Note: These are workspace files (notebooks, libraries) - NOT DBFS files
-
-Results:
-  Files found: {workspace_file_count}
-  Estimated size: {workspace_total_size:,} bytes ({workspace_total_size / (1024**3):.2f} GB)
-
-Technical Details:
-  - Method: Workspace API (/api/2.0/workspace/list)
-  - Scans: Notebooks, libraries, Python files, folders
-  - Different from: DBFS API which scans data files in dbfs:/Users/{username}
-  {"- Cluster ID: " + cluster_id if cluster_id else ""}
-
-What You're Seeing:
-  ✅ Workspace files visible in the UI browser (Workspace → Users → {username})
-  ❌ DBFS files not accessible or empty (Data → DBFS → Users → {username})
-
-This is normal! Most users have notebooks in the Workspace File System,
-but may not have data files in DBFS."""
-            return "success", message
-
-        # If we get here, all methods failed
-        if cluster_id:
-            message = f"""User Information:
-  Username: {username}
-  Display Name: {user_display}
-  Email: {user_email}
-
-File Listing Status:
-  ❌ All file listing methods failed
-
-Technical Details:
-  - Spark Connect: Failed with status: {status}
-  - DBFS API: Failed with status: {status}
-  - Workspace API: Failed with status: {workspace_status}
-  - Cluster ID: {cluster_id}
-
-Troubleshooting:
-  1. Verify the cluster is running: databricks clusters list
-  2. Verify the cluster ID is correct
-  3. Check token has permissions for both DBFS and Workspace access
-  4. Verify user directories exist:
-     - DBFS: /Users/{username} (data files)
-     - Workspace: /Users/{username} (notebooks)
-  5. Try running with --debug flag for more details"""
-            return "failed", message
-
-        # If we get here, API method didn't find files
-        # This code path is for when DBFS returns "no files found"
-        if status == "no_files_found_api" or status == "no_files_found":
-            # Workspace API was already tried above, use that result
-            if workspace_status == "success_workspace_api":
-                # Already returned above, should not reach here
-                pass
-            elif workspace_status == "no_workspace_files_found":
-                message = f"""User Information:
   Username: {username}
   Display Name: {user_display}
   Email: {user_email}
 
 File Listing Status:
   ✅ APIs working correctly
-  ℹ️  No files found in either location
+  ℹ️  No files found in either file system
 
 Technical Details:
   - DBFS API: ✅ Checked - no files in dbfs:/Users/{username}
   - Workspace API: ✅ Checked - no files in /Users/{username}
-  {"- Cluster Spark check: Also returned no files" if cluster_id else ""}
+  {"- Cluster ID: " + cluster_id if cluster_id else ""}
 
 Result: User has no files in either:
   - DBFS (data files): dbfs:/Users/{username}
   - Workspace (notebooks): /Users/{username}
 
 This is normal for new or inactive users."""
-                return "failed", message
-            else:
-                message = f"""User Information:
+            return "failed", message
+        else:
+            # At least one API failed
+            message = f"""User Information:
   Username: {username}
   Display Name: {user_display}
   Email: {user_email}
 
 File Listing Status:
-  ⚠️  Mixed results
+  ⚠️  One or more APIs failed
 
 Technical Details:
-  - DBFS API: No files found
-  - Workspace API: {workspace_status}
+  - DBFS API status: {dbfs_status}
+  - Workspace API status: {workspace_status}
   {"- Cluster ID: " + cluster_id if cluster_id else ""}
 
-Note: DBFS directory is empty, but Workspace API check had issues."""
-                return "failed", message
+Troubleshooting:
+  1. Check token has permissions for both DBFS and Workspace access
+  2. Verify user directories exist:
+     - DBFS: /Users/{username} (data files)
+     - Workspace: /Users/{username} (notebooks)
+  3. Try running with --debug flag for more details"""
+            return "failed", message
 
         # If no cluster_id, get server runtime info for diagnostics
         if debug:
@@ -1245,86 +1210,104 @@ def process_user_on_worker(user_data: str) -> Dict:
                         return
                     time.sleep(min(2 ** retry_count, 16))
 
-        # Process the user - try DBFS first
-        file_source = "dbfs"  # Track which API found the files
+        # Process the user - scan DBFS first
+        dbfs_file_count = 0
+        dbfs_dir_count = 0
+        dbfs_size = 0
+
+        # Store original counts before DBFS scan
         list_recursive(home_path)
+        dbfs_file_count = file_count
+        dbfs_dir_count = dir_count
+        dbfs_size = total_size
 
-        # If no files found in DBFS, try Workspace API
-        if file_count == 0:
-            if debug:
-                print(f"[WORKER] {worker_info} - No DBFS files for {username}, trying Workspace API...")
+        if debug and dbfs_file_count > 0:
+            print(f"[WORKER] {worker_info} - [DBFS] Found {dbfs_file_count} files for {username}")
 
-            workspace_file_count = 0
-            workspace_dir_count = 0
+        # Now scan Workspace API (always, not just as fallback)
+        workspace_file_count = 0
+        workspace_dir_count = 0
 
-            def list_workspace_recursive(path: str, depth: int = 0, max_depth: int = 10):
-                nonlocal workspace_file_count, workspace_dir_count, request_count, rate_limit_delay
+        def list_workspace_recursive(path: str, depth: int = 0, max_depth: int = 10):
+            nonlocal workspace_file_count, workspace_dir_count, request_count, rate_limit_delay
 
-                if depth > max_depth:
-                    return
+            if depth > max_depth:
+                return
 
-                max_retries = 5
-                retry_count = 0
+            max_retries = 5
+            retry_count = 0
 
-                while retry_count < max_retries:
-                    try:
-                        if request_count > 0:
-                            time.sleep(rate_limit_delay)
+            while retry_count < max_retries:
+                try:
+                    if request_count > 0:
+                        time.sleep(rate_limit_delay)
 
-                        request_count += 1
+                    request_count += 1
 
-                        url = f"{workspace_url}/api/2.0/workspace/list"
-                        response = requests.get(
-                            url,
-                            headers=headers,
-                            json={"path": path},
-                            timeout=30
-                        )
+                    url = f"{workspace_url}/api/2.0/workspace/list"
+                    response = requests.get(
+                        url,
+                        headers=headers,
+                        json={"path": path},
+                        timeout=30
+                    )
 
-                        if response.status_code == 404:
-                            return
-                        elif response.status_code == 429:
-                            retry_count += 1
-                            wait_time = min(2 ** retry_count, 32)
-                            time.sleep(wait_time)
-                            rate_limit_delay = min(rate_limit_delay * 1.5, 1.0)
-                            continue
-                        elif response.status_code != 200:
-                            return
-
-                        data = response.json()
-                        objects = data.get("objects", [])
-
-                        for obj in objects:
-                            object_path = obj.get("path", "")
-                            object_type = obj.get("object_type", "")
-
-                            if object_type == "DIRECTORY":
-                                workspace_dir_count += 1
-                                list_workspace_recursive(object_path, depth + 1, max_depth)
-                            else:
-                                # NOTEBOOK, LIBRARY, FILE, etc.
-                                workspace_file_count += 1
-
+                    if response.status_code == 404:
+                        return
+                    elif response.status_code == 429:
+                        retry_count += 1
+                        wait_time = min(2 ** retry_count, 32)
+                        time.sleep(wait_time)
+                        rate_limit_delay = min(rate_limit_delay * 1.5, 1.0)
+                        continue
+                    elif response.status_code != 200:
                         return
 
-                    except Exception:
-                        retry_count += 1
-                        if retry_count >= max_retries:
-                            return
-                        time.sleep(min(2 ** retry_count, 16))
+                    data = response.json()
+                    objects = data.get("objects", [])
 
-            # Scan Workspace
-            list_workspace_recursive(home_path)
+                    for obj in objects:
+                        object_path = obj.get("path", "")
+                        object_type = obj.get("object_type", "")
 
-            # If found workspace files, use those
-            if workspace_file_count > 0:
-                file_count = workspace_file_count
-                dir_count = workspace_dir_count
-                total_size = workspace_file_count * 10000  # Estimate 10KB per file
-                file_source = "workspace"  # Mark as workspace files
-                if debug:
-                    print(f"[WORKER] {worker_info} - Found {workspace_file_count} workspace files for {username}")
+                        if object_type == "DIRECTORY":
+                            workspace_dir_count += 1
+                            list_workspace_recursive(object_path, depth + 1, max_depth)
+                        else:
+                            # NOTEBOOK, LIBRARY, FILE, etc.
+                            workspace_file_count += 1
+
+                    return
+
+                except Exception:
+                    retry_count += 1
+                    if retry_count >= max_retries:
+                        return
+                    time.sleep(min(2 ** retry_count, 16))
+
+        # Scan Workspace (always, to cumulate with DBFS)
+        if debug:
+            print(f"[WORKER] {worker_info} - [WORKSPACE] Scanning workspace files for {username}...")
+        list_workspace_recursive(home_path)
+
+        if debug and workspace_file_count > 0:
+            print(f"[WORKER] {worker_info} - [WORKSPACE] Found {workspace_file_count} files for {username}")
+
+        # Cumulate results from both sources
+        file_count = dbfs_file_count + workspace_file_count
+        dir_count = dbfs_dir_count + workspace_dir_count
+        workspace_size = workspace_file_count * 10000  # Estimate 10KB per workspace file
+        total_size = dbfs_size + workspace_size
+
+        # Determine file source
+        if dbfs_file_count > 0 and workspace_file_count > 0:
+            file_source = "both"
+        elif dbfs_file_count > 0:
+            file_source = "dbfs"
+        elif workspace_file_count > 0:
+            file_source = "workspace"
+        else:
+            file_source = "none"
 
         # Debug: Print completion time on worker
         end_time = datetime.now()
@@ -1378,7 +1361,8 @@ def process_user_on_worker(user_data: str) -> Dict:
 
 
 def process_multiple_users_parallel(usernames: List[str], workspace_url: str, token: str,
-                                    cluster_id: Optional[str] = None, debug: bool = False) -> List[Dict]:
+                                    cluster_id: Optional[str] = None, debug: bool = False,
+                                    resume: bool = False) -> List[Dict]:
     """
     Process multiple users in parallel using Spark cluster workers.
     This distributes the work across all available workers for maximum speed.
@@ -1389,13 +1373,63 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
         token: Access token
         cluster_id: Cluster ID (required for parallel processing)
         debug: Enable debug output
+        resume: Resume from checkpoint file if it exists
 
     Returns:
         List of result dictionaries for each user
     """
     from datetime import datetime
+    import os
 
     parallel_start_time = datetime.now()
+    checkpoint_file = ".checkpoint_progress.json"
+    previous_results = []
+    original_user_count = len(usernames)
+
+    # Check for checkpoint and resume if requested
+    if resume and os.path.exists(checkpoint_file):
+        try:
+            with open(checkpoint_file, 'r') as f:
+                checkpoint_data = json.load(f)
+
+            previous_results = checkpoint_data.get("results", [])
+            completed_users = set(r["username"] for r in previous_results)
+            remaining_users = [u for u in usernames if u not in completed_users]
+
+            print(f"\n{'='*80}")
+            print(f"RESUMING FROM CHECKPOINT")
+            print(f"{'='*80}")
+            print(f"Checkpoint file: {checkpoint_file}")
+            print(f"Checkpoint timestamp: {checkpoint_data.get('timestamp', 'unknown')}")
+            print(f"Original total users: {original_user_count}")
+            print(f"Already completed: {len(previous_results)}")
+            print(f"Remaining to process: {len(remaining_users)}")
+            print(f"Last completed user: {checkpoint_data.get('last_completed_user', 'unknown')}")
+            print(f"{'='*80}\n")
+
+            if len(remaining_users) == 0:
+                print("✓ All users already processed! Nothing to do.\n")
+                return previous_results
+
+            # Update usernames to only process remaining users
+            usernames = remaining_users
+
+            if debug:
+                print(f"Resuming with {len(usernames)} remaining users:")
+                for idx, username in enumerate(usernames[:10], 1):
+                    print(f"  {idx}. {username}")
+                if len(usernames) > 10:
+                    print(f"  ... and {len(usernames) - 10} more")
+                print()
+
+        except Exception as e:
+            print(f"Warning: Could not load checkpoint file: {e}")
+            print(f"Starting fresh processing of all {len(usernames)} users\n")
+            previous_results = []
+
+    elif resume:
+        print(f"⚠️  Resume requested but no checkpoint file found: {checkpoint_file}")
+        print(f"Starting fresh processing of all {len(usernames)} users\n")
 
     try:
         from pyspark.sql import SparkSession
@@ -1613,12 +1647,18 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
         result_df = users_df.mapInPandas(process_users_batch, schema=output_schema)
 
         # Collect results with progress output in debug mode
+        # Save checkpoint incrementally to enable resume on failure
+        checkpoint_file = ".checkpoint_progress.json"
+
         if debug:
             print("Processing users across workers (showing results as they complete)...\n")
-            results = []
-            processed_count = 0
+            print(f"💾 Checkpoint file: {checkpoint_file} (progress saved incrementally)\n")
 
-            # Use toLocalIterator for incremental result streaming
+        results = []
+        processed_count = 0
+
+        # Use toLocalIterator for incremental result streaming
+        try:
             for row in result_df.toLocalIterator():
                 processed_count += 1
                 result = {
@@ -1636,22 +1676,108 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
                 }
                 results.append(result)
 
-                # Show per-user progress with worker and timing info
-                size_str = format_size(result["total_size"])
-                status_icon = "✓" if result["status"] == "success" else ("⚠" if result["status"] == "empty" else "✗")
-                error_msg = f" - {result['error']}" if result['error'] else ""
-                worker_info = f"[{result['worker_id']}]" if result['worker_id'] else ""
-                duration_info = f"({result['duration_seconds']:.1f}s)" if result['duration_seconds'] > 0 else ""
-                timing_info = f"start={result['start_time']} end={result['end_time']}" if result['start_time'] else ""
-                source_info = f"[{result['file_source'].upper()}]" if result.get('file_source') else ""
+                # Save checkpoint after each result (enables resume on failure)
+                try:
+                    with open(checkpoint_file, 'w') as f:
+                        json.dump({
+                            "total_users": len(usernames),
+                            "processed_count": processed_count,
+                            "last_completed_user": result["username"],
+                            "timestamp": datetime.now().isoformat(),
+                            "results": results
+                        }, f, indent=2)
+                except Exception as checkpoint_error:
+                    if debug:
+                        print(f"Warning: Could not save checkpoint: {checkpoint_error}")
 
-                print(f"  [{processed_count}/{len(usernames)}] {status_icon} {worker_info} {source_info} {result['username']}: "
-                      f"{result['file_count']} files ({size_str}) {duration_info}")
-                if timing_info:
-                    print(f"      ↳ {timing_info}{error_msg}")
+                if debug:
+                    # Show per-user progress with worker and timing info
+                    size_str = format_size(result["total_size"])
+                    status_icon = "✓" if result["status"] == "success" else ("⚠" if result["status"] == "empty" else "✗")
+                    error_msg = f" - {result['error']}" if result['error'] else ""
+                    worker_info = f"[{result['worker_id']}]" if result['worker_id'] else ""
+                    duration_info = f"({result['duration_seconds']:.1f}s)" if result['duration_seconds'] > 0 else ""
+                    timing_info = f"start={result['start_time']} end={result['end_time']}" if result['start_time'] else ""
+                    source_info = f"[{result['file_source'].upper()}]" if result.get('file_source') else ""
 
-            print()  # Empty line after all users
-        else:
+                    print(f"  [{processed_count}/{len(usernames)}] {status_icon} {worker_info} {source_info} {result['username']}: "
+                          f"{result['file_count']} files ({size_str}) {duration_info}")
+                    if timing_info:
+                        print(f"      ↳ {timing_info}{error_msg}")
+
+            if debug:
+                print()  # Empty line after all users
+
+            # Delete checkpoint file on successful completion
+            try:
+                import os
+                if os.path.exists(checkpoint_file):
+                    os.remove(checkpoint_file)
+                    if debug:
+                        print(f"✓ Checkpoint file removed (processing completed successfully)\n")
+            except:
+                pass
+
+        except Exception as stream_error:
+            # Handle streaming/timeout errors during result collection
+            error_msg = str(stream_error)
+            is_timeout = "INVALID_HANDLE" in error_msg or "OPERATION_ABANDONED" in error_msg or "abandoned" in error_msg.lower()
+
+            print(f"\n{'='*80}")
+            print(f"⚠️  PARALLEL PROCESSING INTERRUPTED")
+            print(f"{'='*80}")
+            print(f"Processed: {processed_count}/{len(usernames)} users before interruption")
+            print(f"Last completed: {results[-1]['username'] if results else 'None'}")
+            print(f"Error: {error_msg}")
+            print(f"{'='*80}\n")
+
+            if is_timeout:
+                print("This appears to be a timeout/session abandonment error.")
+                print("Long-running operations (>30-60 minutes) may be abandoned by the server.\n")
+
+            # Save partial results to checkpoint
+            if results:
+                try:
+                    with open(checkpoint_file, 'w') as f:
+                        json.dump({
+                            "total_users": len(usernames),
+                            "processed_count": processed_count,
+                            "last_completed_user": results[-1]["username"],
+                            "timestamp": datetime.now().isoformat(),
+                            "interrupted": True,
+                            "error": error_msg,
+                            "results": results
+                        }, f, indent=2)
+                    print(f"💾 Progress saved to checkpoint: {checkpoint_file}")
+                    print(f"   {processed_count} users completed successfully\n")
+                except Exception as save_error:
+                    print(f"Warning: Could not save checkpoint: {save_error}\n")
+
+            # Provide recovery instructions
+            print(f"{'='*80}")
+            print(f"RECOVERY OPTIONS")
+            print(f"{'='*80}")
+            print(f"Option 1 - Resume from checkpoint (RECOMMENDED):")
+            print(f"  python databricks_user_files_simple.py \\")
+            print(f"    --users-file <your-file> \\")
+            print(f"    --profile <your-profile> \\")
+            print(f"    --cluster-id <your-cluster> \\")
+            print(f"    --resume")
+            print()
+            print(f"Option 2 - Process in smaller batches:")
+            print(f"  # Split your user file into smaller chunks (e.g., 50-100 users each)")
+            print(f"  # Then process each batch separately")
+            print()
+            print(f"Option 3 - Continue with partial results:")
+            print(f"  # The checkpoint file contains all successfully processed users")
+            print(f"  # Extract results: cat {checkpoint_file} | jq .results")
+            print(f"{'='*80}\n")
+
+            # Raise the error to be caught by outer exception handler
+            raise
+
+        # Non-debug mode: collect all at once
+        if not debug:
             print("Collecting results from workers...\n")
             results_rows = result_df.collect()
 
@@ -1705,6 +1831,18 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
                 print(f"Note: All work was processed by a single executor: {list(unique_workers)[0]}")
                 print(f"      (This may indicate a single-node cluster or low parallelism)\n")
 
+        # Merge with previous results if resuming
+        if previous_results:
+            combined_results = previous_results + results
+            print(f"{'='*80}")
+            print(f"RESUME SUMMARY")
+            print(f"{'='*80}")
+            print(f"Previous completed users: {len(previous_results)}")
+            print(f"Newly processed users: {len(results)}")
+            print(f"Total users processed: {len(combined_results)}")
+            print(f"{'='*80}\n")
+            return combined_results
+
         return results
 
     except Exception as e:
@@ -1721,7 +1859,8 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
 def process_multiple_users(usernames: List[str], workspace_url: Optional[str] = None,
                           token: Optional[str] = None, cluster_id: Optional[str] = None,
                           profile: Optional[str] = None, debug: bool = False,
-                          output_csv: Optional[str] = None, parallel: bool = True) -> List[Dict]:
+                          output_csv: Optional[str] = None, parallel: bool = True,
+                          resume: bool = False) -> List[Dict]:
     """
     Process multiple users and return results.
     Automatically uses parallel processing if cluster_id is provided, otherwise sequential.
@@ -1734,6 +1873,7 @@ def process_multiple_users(usernames: List[str], workspace_url: Optional[str] = 
         profile: CLI profile name
         debug: Enable debug output
         output_csv: Optional CSV output file path
+        resume: Resume from checkpoint file if available
         parallel: If True and cluster_id provided, use parallel processing (default: True)
 
     Returns:
@@ -1759,7 +1899,8 @@ def process_multiple_users(usernames: List[str], workspace_url: Optional[str] = 
             workspace_url=workspace_url,
             token=token,
             cluster_id=cluster_id,
-            debug=debug
+            debug=debug,
+            resume=resume
         )
 
         # If parallel processing succeeded, skip sequential
@@ -1940,6 +2081,9 @@ Examples:
   # Multiple users from file with CSV output (parallel)
   python databricks_user_files_simple.py --users-file users.txt --profile PROD --cluster-id 1234-567890-abc123 --output results.csv
 
+  # Resume from checkpoint after timeout/failure
+  python databricks_user_files_simple.py --users-file users.txt --profile PROD --cluster-id 1234-567890-abc123 --resume
+
   # Force sequential even with cluster
   python databricks_user_files_simple.py --users-file users.txt --profile PROD --cluster-id 1234-567890-abc123 --no-parallel
 
@@ -1958,6 +2102,7 @@ Performance Note:
     parser.add_argument("--cluster-id", help="Cluster ID for Spark Connect (enables PARALLEL processing)")
     parser.add_argument("--output", "-o", help="Output CSV file path for results")
     parser.add_argument("--no-parallel", action="store_true", help="Disable parallel processing (force sequential)")
+    parser.add_argument("--resume", action="store_true", help="Resume from checkpoint file if available (.checkpoint_progress.json)")
     parser.add_argument("--debug", action="store_true", help="Enable debug output")
 
     args = parser.parse_args()
@@ -2040,7 +2185,8 @@ Performance Note:
                 profile=args.profile,
                 debug=args.debug,
                 output_csv=args.output,
-                parallel=not args.no_parallel  # Enable parallel by default unless --no-parallel
+                parallel=not args.no_parallel,  # Enable parallel by default unless --no-parallel
+                resume=args.resume  # Resume from checkpoint if requested
             )
 
         # Record end time and calculate duration

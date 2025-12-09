@@ -80,41 +80,50 @@ python databricks_user_files_simple.py --users-file users.csv --cluster-id CLUST
 **You're probably looking at:** Workspace File System (notebooks)
 **The API was checking:** DBFS (data files)
 
-**Solution:** The script now checks BOTH automatically!
+**Solution:** The script now scans BOTH and cumulates the results!
 
 ### Example Output
+
+**When you have files in both locations:**
+```
+File Listing Status:
+  ✅ Successfully scanned both file systems
+  ✅ DBFS: 1234 files
+  ✅ Workspace: 15 files (notebooks/libraries)
+
+Combined Results:
+  Total files: 1,249 (from DBFS + Workspace)
+  Total size: 52,828,912 bytes (0.05 GB)
+```
 
 **When you have notebooks but no DBFS files:**
 ```
 File Listing Status:
-  ✅ Successfully listed files via Workspace API
-  ℹ️  Note: These are workspace files (notebooks, libraries) - NOT DBFS files
+  ✅ Successfully scanned both file systems
+  ⊘ DBFS: No files
+  ✅ Workspace: 15 files (notebooks/libraries)
 
-Results:
-  Files found: 15
-  Estimated size: 150,000 bytes (0.00 GB)
-
-What You're Seeing:
-  ✅ Workspace files visible in the UI browser (Workspace → Users → user@example.com)
-  ❌ DBFS files not accessible or empty (Data → DBFS → Users → user@example.com)
-
-This is normal! Most users have notebooks in the Workspace File System,
-but may not have data files in DBFS.
+Combined Results:
+  Total files: 15 (from Workspace)
+  Total size: 150,000 bytes (0.00 GB)
 ```
 
 ## How the Script Now Works
 
-### Automatic Fallback Chain
+### Cumulative Scanning (Not Fallback!)
 
-1. **Try DBFS API first** (data files)
+1. **Scan DBFS API** (data files)
    - Endpoint: `/api/2.0/dbfs/list`
    - Path: `dbfs:/Users/{username}`
 
-2. **If DBFS fails or empty, try Workspace API** (notebooks)
+2. **Scan Workspace API** (notebooks) - ALWAYS scanned, not just fallback
    - Endpoint: `/api/2.0/workspace/list`
    - Path: `/Users/{username}`
 
-3. **Report which location has files**
+3. **Cumulate results** from both sources
+   - File counts are added together
+   - Sizes are added together
+   - Source is marked as: `both`, `dbfs`, `workspace`, or `none`
 
 ### Commands
 
@@ -186,10 +195,11 @@ Databricks UI:
 
 ## Summary
 
-- **Two file systems** = Two different locations
-- **Script now checks both** = No more confusion
+- **Two file systems** = Two different locations that are both scanned
+- **Script cumulates results** = File counts and sizes from both DBFS and Workspace are added together
 - **DBFS** = Data files (CSV, Parquet, etc.)
 - **Workspace** = Notebooks and code
-- **Most users** = Have notebooks (Workspace) but not data (DBFS)
+- **file_source column** = Shows which system(s) had files: `both`, `dbfs`, `workspace`, or `none`
+- **Most users** = Have notebooks (Workspace) and may also have data (DBFS)
 
-This is working as designed! The script will tell you which location has files.
+This is working as designed! The script gives you a complete inventory by scanning both file systems.

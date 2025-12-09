@@ -23,10 +23,11 @@ python databricks_user_files_simple.py \
 ## ✨ Key Features
 
 - **⚡ Parallel Processing** - 10-100x faster by distributing work across cluster workers
-- **🔍 Dual File System Scanning** - Automatically checks both DBFS (data files) and Workspace (notebooks)
+- **🔍 Dual File System Scanning** - Automatically scans both DBFS (data files) and Workspace (notebooks) for every user
+- **➕ Cumulative Results** - Combines file counts and sizes from both DBFS and Workspace into total inventory
+- **💾 Checkpoint & Resume** - Automatically saves progress; resume from where you left off after timeouts
 - **📊 Comprehensive Results** - Tracks file count, size, source, and status for each user
 - **🎯 Real-Time Progress** - See live updates as workers process users in parallel
-- **🛡️ Automatic Fallback** - If DBFS is empty, automatically tries Workspace API
 - **📈 Scalable** - Efficiently handles 1000+ users with proper cluster sizing
 - **🔧 SparkConnect Compatible** - Works with both traditional and serverless clusters
 
@@ -43,14 +44,18 @@ alice.wong@company.com
 ### Inventory Results (`results.csv`)
 ```csv
 username,file_count,total_size,total_size_gb,status,file_source,error
-john.doe@company.com,1234,52678912,0.05,success,dbfs,
+john.doe@company.com,1234,52678912,0.05,success,both,
 jane.smith@company.com,567,24234567,0.02,success,dbfs,
 alice.wong@company.com,15,150000,0.00,success,workspace,
+bob.jones@company.com,0,0,0.00,empty,none,
 ```
 
-**Note:** The tool automatically scans both file systems:
+**Note:** The tool automatically scans and **cumulates** results from both file systems:
 - **DBFS** (Databricks File System) - Data files, CSV, Parquet, etc.
 - **Workspace** - Notebooks, libraries, Python files
+- **Both** are scanned for every user, and file counts/sizes are added together
+
+The `file_source` column shows which file system(s) contained files: `both`, `dbfs`, `workspace`, or `none`.
 
 See [WORKSPACE_VS_DBFS.md](WORKSPACE_VS_DBFS.md) for details on the two file systems.
 
@@ -305,6 +310,7 @@ Options:
   --cluster-id ID          Cluster ID (enables PARALLEL processing)
   -o, --output FILE        Output CSV file path
   --no-parallel            Force sequential mode (even with cluster)
+  --resume                 Resume from checkpoint file (.checkpoint_progress.json)
   --debug                  Enable debug output
 
 Examples:
@@ -320,6 +326,13 @@ Examples:
     --profile PROD \
     --cluster-id 1234-567890-abc123 \
     --output results.csv
+
+  # Resume from checkpoint after timeout/failure
+  python databricks_user_files_simple.py \
+    --users-file users.csv \
+    --profile PROD \
+    --cluster-id 1234-567890-abc123 \
+    --resume
 
   # Sequential processing (no cluster)
   python databricks_user_files_simple.py \
@@ -495,19 +508,20 @@ alice.wong@company.com,0,0,0.00,error,unknown,User not found
 
 **Columns:**
 - `username` - User email address
-- `file_count` - Number of files found
-- `total_size` - Total size in bytes
+- `file_count` - **Cumulative** count from both DBFS and Workspace
+- `total_size` - **Cumulative** size in bytes from both DBFS and Workspace
 - `total_size_gb` - Total size in GB (rounded)
 - `status` - `success`, `empty`, or `error`
-- `file_source` - Where files were found: `dbfs` (data files), `workspace` (notebooks), or `unknown`
+- `file_source` - Which file system(s) contained files: `both`, `dbfs`, `workspace`, or `none`
 - `error` - Error message (if status is error)
 
 **Understanding file_source:**
-- **`dbfs`** - Files found in DBFS (Databricks File System): data files, CSV, Parquet, etc.
-- **`workspace`** - Files found in Workspace: notebooks, libraries, Python files
-- **`unknown`** - No files found or error occurred
+- **`both`** - Files found in both DBFS and Workspace (counts and sizes are cumulated)
+- **`dbfs`** - Files only in DBFS (Databricks File System): data files, CSV, Parquet, etc.
+- **`workspace`** - Files only in Workspace: notebooks, libraries, Python files
+- **`none`** - No files found in either location
 
-The tool automatically checks both locations for each user.
+The tool automatically scans **both** file systems for each user and adds the results together.
 
 ---
 
@@ -627,6 +641,62 @@ pyenv local 3.11.0
 - **Workspace** (`/Users/{username}`) - Notebooks and code
 
 Most users have notebooks in Workspace but no data files in DBFS. This is normal!
+
+### "OPERATION_ABANDONED" or timeout errors during parallel processing
+
+**Symptom:**
+```
+⚠️  PARALLEL PROCESSING INTERRUPTED
+Processed: 45/100 users before interruption
+Last completed: user@example.com
+
+Error: [INVALID_HANDLE.OPERATION_ABANDONED] The handle ... is invalid.
+Operation was considered abandoned because of inactivity and removed.
+```
+
+**Cause:** Long-running parallel operations (>30-60 minutes) can timeout due to inactivity limits.
+
+**Solution - Use Resume Flag:**
+```bash
+# Resume from where it left off
+python databricks_user_files_simple.py \
+  --users-file users.csv \
+  --profile PROD \
+  --cluster-id YOUR_CLUSTER_ID \
+  --resume
+```
+
+**How it works:**
+1. During parallel processing, progress is saved incrementally to `.checkpoint_progress.json`
+2. Each user completion is checkpointed immediately
+3. On timeout/failure, you'll see recovery instructions
+4. Use `--resume` flag to skip already-completed users
+5. Results from previous run are merged with new results
+
+**Example Recovery:**
+```bash
+# First run (times out after 45 minutes, processed 50/100 users)
+python databricks_user_files_simple.py --users-file users.csv --profile PROD --cluster-id ABC123
+
+# Output shows:
+# ⚠️  PARALLEL PROCESSING INTERRUPTED
+# Processed: 50/100 users before interruption
+# Last completed: user50@example.com
+
+# Resume from checkpoint (processes remaining 50 users)
+python databricks_user_files_simple.py --users-file users.csv --profile PROD --cluster-id ABC123 --resume
+
+# Output shows:
+# RESUMING FROM CHECKPOINT
+# Already completed: 50
+# Remaining to process: 50
+```
+
+**Tips:**
+- Checkpoint file (`.checkpoint_progress.json`) is saved after each user completion
+- Safe to delete checkpoint file to start fresh: `rm .checkpoint_progress.json`
+- Resume works with same `--users-file` and skips completed users
+- Final output merges all results (previous + new)
 
 ### Parallel processing falls back to sequential
 
