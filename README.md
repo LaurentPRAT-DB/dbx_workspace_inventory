@@ -370,13 +370,15 @@ Processing users across workers (showing results as they complete)...
 
 [WORKER START] Executor-0 processing john.doe@company.com - 2025-12-08 14:30:05
 [WORKER START] Executor-1 processing alice.wong@company.com - 2025-12-08 14:30:05
-[WORKER] Executor-1 - No DBFS files for alice.wong@company.com, trying Workspace API...
-[WORKER] Executor-1 - Found 15 workspace files for alice.wong@company.com
+[WORKER] Executor-1 - [DBFS] Found 0 files for alice.wong@company.com
+[WORKER] Executor-1 - [WORKSPACE] Scanning workspace files for alice.wong@company.com...
+[WORKER] Executor-1 - Rate limited (429) on /Users/alice.wong@company.com, retrying in 2s (attempt 1/5)
+[WORKER] Executor-1 - [WORKSPACE] Found 15 files for alice.wong@company.com
 [WORKER COMPLETE] Executor-1 finished alice.wong@company.com - 2025-12-08 14:30:08 (duration: 3.2s, files: 15, size: 150000)
   [1/100] ✓ [Executor-1] [WORKSPACE] alice.wong@company.com: 15 files (146.5 KB) (3.2s)
       ↳ start=2025-12-08 14:30:05 end=2025-12-08 14:30:08
 [WORKER COMPLETE] Executor-0 finished john.doe@company.com - 2025-12-08 14:30:15 (duration: 10.3s, files: 1234, size: 55234567)
-  [2/100] ✓ [Executor-0] [DBFS] john.doe@company.com: 1234 files (52.7 MB) (10.3s)
+  [2/100] ✓ [Executor-0] [BOTH] john.doe@company.com: 1234 files (52.7 MB) (10.3s)
       ↳ start=2025-12-08 14:30:05 end=2025-12-08 14:30:15
   ...
 
@@ -391,10 +393,20 @@ PARALLEL EXECUTION CONFIRMED
 ================================================================================
 ```
 
-**Status Icons:**
+**Status Icons & Source Tags:**
 - ✓ Success: Files found
 - ⚠ Empty: Directory exists but no files
 - ✗ Error: Scan failed (permission, missing directory, etc.)
+
+**File Source Tags:**
+- [DBFS]: Files found only in DBFS (data files)
+- [WORKSPACE]: Files found only in Workspace (notebooks)
+- [BOTH]: Files found in both DBFS and Workspace (cumulated)
+
+**Retry Messages (when --debug enabled):**
+- Rate limited (429): API throttling, automatic retry with backoff
+- Server error (500/503): Temporary server issue, automatic retry
+- Request error: Network issue, automatic retry
 
 **Debug Output Shows:**
 - **User distribution list**: All users to be processed before work starts
@@ -924,7 +936,9 @@ python databricks_user_files_simple.py --users-file users.csv --profile PROD --d
 # 1. Use parallel mode (requires cluster)
 # 2. Use 4-8 worker cluster for best results
 # 3. Test with small batches first
-# 4. Monitor timing logs to optimize
+# 4. Use --resume flag for 500+ users (handles timeouts)
+# 5. Trust automatic retry logic for API errors
+# 6. Monitor timing logs with --debug to optimize
 ```
 
 ---
