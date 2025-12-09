@@ -1148,13 +1148,21 @@ def process_user_on_worker(user_data: str) -> Dict:
         token = data["token"]
         debug = data.get("debug", False)
 
-        # Get worker/executor information
+        # Get worker/executor information with hostname for better identification
         worker_info = "Unknown"
+        partition_id = "Unknown"
         try:
             from pyspark import TaskContext
             task_context = TaskContext.get()
             if task_context:
-                worker_info = f"Executor-{task_context.partitionId()}"
+                partition_id = task_context.partitionId()
+                try:
+                    import socket
+                    hostname = socket.gethostname()
+                    # Use last 8 chars of hostname + partition ID
+                    worker_info = f"{hostname[-8:]}-P{partition_id}"
+                except:
+                    worker_info = f"Executor-P{partition_id}"
         except:
             pass
 
@@ -1630,32 +1638,51 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
             print()
 
         # Create DataFrame for parallel processing
-        users_df = spark.createDataFrame([{"user_data": ud} for ud in user_data_list])
+        # Strategy: Create optimal number of partitions based on cluster size and user count
+        # Each partition should have multiple users to reduce task overhead
 
-        # Repartition to enable parallel processing across multiple workers
-        # Create one partition per user (up to a reasonable limit of 200)
-        # This maximizes parallelism and allows each executor to process users independently
-        num_partitions = min(len(user_data_list), 200)
-        users_df = users_df.repartition(num_partitions)
+        # Determine optimal partitioning
+        try:
+            default_parallelism = int(spark.conf.get('spark.default.parallelism', '8'))
+        except:
+            default_parallelism = 8
+
+        if num_workers and num_workers > 0:
+            # Aim for 2-4 partitions per worker core for good load balancing
+            # Assuming 4 cores per worker (typical for Standard_DS3_v2)
+            estimated_cores = num_workers * 4
+            num_partitions = min(estimated_cores * 2, len(user_data_list), 200)
+        else:
+            # Use default parallelism * 2 for good distribution
+            num_partitions = min(default_parallelism * 2, len(user_data_list), 200)
+
+        # Ensure at least 1 partition
+        num_partitions = max(1, num_partitions)
+
+        # Create DataFrame with explicit number of partitions
+        # Use parallelize-like approach: distribute users across partitions upfront
+        users_per_partition = max(1, len(user_data_list) // num_partitions)
 
         if debug:
-            # Use num_partitions directly (already calculated above)
-            # Note: Cannot use .rdd.getNumPartitions() in Spark Connect
-            actual_partitions = num_partitions
-            print(f"DataFrame partitioned into {actual_partitions} partitions for parallel processing")
-            print(f"Each partition will be processed by a different executor")
+            print(f"\n{'='*80}")
+            print(f"PARTITIONING STRATEGY")
+            print(f"{'='*80}")
+            print(f"Total users: {len(user_data_list)}")
+            print(f"Target partitions: {num_partitions}")
+            print(f"Users per partition: ~{users_per_partition}")
+            if num_workers:
+                print(f"Cluster workers: {num_workers}")
+                print(f"Expected distribution: Each worker will process ~{num_partitions // max(num_workers, 1)} partitions")
+            print(f"{'='*80}\n")
 
-            # Show distribution estimate
-            users_per_partition = len(user_data_list) / actual_partitions
-            print(f"Average users per partition: ~{users_per_partition:.1f}")
+        # Create DataFrame and explicitly repartition for parallel distribution
+        users_df = spark.createDataFrame([{"user_data": ud} for ud in user_data_list])
 
-            if num_workers and num_workers > 0:
-                print(f"\nWith {num_workers} worker(s), expect ~{actual_partitions // num_workers} partitions per worker")
-                print(f"All {num_workers} workers will start processing their partitions simultaneously")
-            print()
-        else:
-            # Set actual_partitions for later use in non-debug mode
-            actual_partitions = num_partitions
+        # Use repartition with explicit number to force redistribution across workers
+        users_df = users_df.repartition(num_partitions)
+
+        # Set actual_partitions for later use
+        actual_partitions = num_partitions
 
         # Define output schema
         output_schema = StructType([
@@ -1677,12 +1704,27 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
             import pandas as pd
             import json
             import os
+            from datetime import datetime
 
             # Get worker/executor information
             task_context = None
+            executor_id = "Unknown"
+            partition_id = "Unknown"
+
             try:
                 from pyspark import TaskContext
                 task_context = TaskContext.get()
+                if task_context:
+                    partition_id = task_context.partitionId()
+                    # Try to get actual executor ID (host + executor number)
+                    try:
+                        # In Databricks, this gives us the actual executor identifier
+                        import socket
+                        hostname = socket.gethostname()
+                        # Executor ID format: hostname-executor-N
+                        executor_id = f"{hostname[-8:]}-P{partition_id}"
+                    except:
+                        executor_id = f"Executor-P{partition_id}"
             except:
                 pass
 
@@ -1709,8 +1751,12 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
                         pass
 
                     if debug_mode:
-                        worker_id = f"Executor-{task_context.partitionId()}" if task_context else "Unknown"
-                        print(f"[WORKER BATCH] {worker_id} received {len(batch_users)} user(s): {', '.join(batch_users)}")
+                        batch_start_time = datetime.now().strftime('%H:%M:%S')
+                        user_list = ', '.join(batch_users[:3])
+                        if len(batch_users) > 3:
+                            user_list += f" ... (+{len(batch_users)-3} more)"
+                        print(f"[PARTITION START] Partition {partition_id} on {executor_id} - {batch_start_time}")
+                        print(f"  Processing {len(batch_users)} user(s): {user_list}")
 
                 # Process each user in this batch
                 for user_data_str in pdf['user_data']:
@@ -1897,9 +1943,11 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
 
         print(f"Parallel processing completed in {duration_str}\n")
 
-        # Show parallel execution summary in debug mode
+        # Show parallel execution summary - check work distribution
+        unique_workers = set(r.get("worker_id") for r in results if r.get("worker_id"))
+
         if debug:
-            unique_workers = set(r.get("worker_id") for r in results if r.get("worker_id"))
+            # Detailed summary in debug mode
             if unique_workers and len(unique_workers) > 1:
                 print(f"{'='*80}")
                 print(f"PARALLEL EXECUTION CONFIRMED")
@@ -1910,8 +1958,25 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
                     print(f"  • {worker_id}: processed {len(worker_users)} user(s)")
                 print(f"{'='*80}\n")
             elif unique_workers and len(unique_workers) == 1:
-                print(f"Note: All work was processed by a single executor: {list(unique_workers)[0]}")
-                print(f"      (This may indicate a single-node cluster or low parallelism)\n")
+                print(f"{'='*80}")
+                print(f"⚠️  SEQUENTIAL EXECUTION DETECTED")
+                print(f"{'='*80}")
+                print(f"All work was processed by a single executor: {list(unique_workers)[0]}")
+                print(f"This may indicate:")
+                print(f"  • Single-node cluster (no worker nodes)")
+                print(f"  • Low parallelism settings")
+                print(f"  • Insufficient partitions for distribution")
+                print(f"\nRecommendations:")
+                print(f"  • Use a multi-node cluster with 2+ workers")
+                print(f"  • Increase spark.default.parallelism")
+                print(f"  • Check cluster configuration")
+                print(f"{'='*80}\n")
+        else:
+            # Simple summary in non-debug mode
+            if unique_workers and len(unique_workers) > 1:
+                print(f"✓ Parallel execution confirmed: {len(unique_workers)} executors used\n")
+            elif unique_workers and len(unique_workers) == 1:
+                print(f"⚠️  Note: All work processed by single executor (consider using multi-node cluster)\n")
 
         # Merge with previous results if resuming
         if previous_results:
