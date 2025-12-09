@@ -412,6 +412,18 @@ def list_user_files_via_api_direct(workspace_url: str, token: str, username: str
                         # Increase base delay for future requests
                         rate_limit_delay = min(rate_limit_delay * 1.5, 1.0)
                         continue  # Retry
+                    elif response.status_code in [500, 503]:
+                        # Server errors - retry with backoff
+                        retry_count += 1
+                        if retry_count >= max_retries:
+                            if debug:
+                                print(f"Server error {response.status_code} on {path}, max retries reached")
+                            return
+                        wait_time = min(2 ** retry_count, 16)
+                        if debug:
+                            print(f"Server error {response.status_code} on {path}, retrying in {wait_time}s")
+                        time.sleep(wait_time)
+                        continue
                     elif response.status_code != 200:
                         if debug:
                             print(f"DBFS API error for {path}: {response.status_code}")
@@ -519,11 +531,25 @@ def list_workspace_files_via_api(workspace_url: str, token: str, username: str, 
                         # Path doesn't exist
                         return
                     elif response.status_code == 429:
-                        # Rate limited
+                        # Rate limited - exponential backoff
                         retry_count += 1
                         wait_time = min(2 ** retry_count, 32)
+                        if debug:
+                            print(f"Rate limited (429) on {path}, retrying in {wait_time}s (attempt {retry_count}/{max_retries})")
                         time.sleep(wait_time)
                         rate_limit_delay = min(rate_limit_delay * 1.5, 1.0)
+                        continue
+                    elif response.status_code in [500, 503]:
+                        # Server errors - retry with backoff
+                        retry_count += 1
+                        if retry_count >= max_retries:
+                            if debug:
+                                print(f"Server error {response.status_code} on {path}, max retries reached")
+                            return
+                        wait_time = min(2 ** retry_count, 16)
+                        if debug:
+                            print(f"Server error {response.status_code} on {path}, retrying in {wait_time}s")
+                        time.sleep(wait_time)
                         continue
                     elif response.status_code != 200:
                         if debug:
@@ -1179,12 +1205,29 @@ def process_user_on_worker(user_data: str) -> Dict:
                     if response.status_code == 404:
                         return
                     elif response.status_code == 429:
+                        # Rate limited - exponential backoff
                         retry_count += 1
                         wait_time = min(2 ** retry_count, 32)
+                        if debug:
+                            print(f"[WORKER] {worker_info} - Rate limited (429) on {path}, retrying in {wait_time}s (attempt {retry_count}/{max_retries})")
                         time.sleep(wait_time)
                         rate_limit_delay = min(rate_limit_delay * 1.5, 1.0)
                         continue
+                    elif response.status_code in [500, 503]:
+                        # Server errors - retry with backoff
+                        retry_count += 1
+                        if retry_count >= max_retries:
+                            if debug:
+                                print(f"[WORKER] {worker_info} - Server error {response.status_code} on {path}, max retries reached")
+                            return
+                        wait_time = min(2 ** retry_count, 16)
+                        if debug:
+                            print(f"[WORKER] {worker_info} - Server error {response.status_code} on {path}, retrying in {wait_time}s")
+                        time.sleep(wait_time)
+                        continue
                     elif response.status_code != 200:
+                        if debug:
+                            print(f"[WORKER] {worker_info} - DBFS API returned {response.status_code} for {path}")
                         return
 
                     data = response.json()
@@ -1204,11 +1247,26 @@ def process_user_on_worker(user_data: str) -> Dict:
 
                     return
 
-                except Exception:
+                except requests.exceptions.RequestException as e:
+                    # Network/connection errors - retry with backoff
                     retry_count += 1
                     if retry_count >= max_retries:
+                        if debug:
+                            print(f"[WORKER] {worker_info} - Request failed after {max_retries} retries for {path}: {str(e)}")
                         return
-                    time.sleep(min(2 ** retry_count, 16))
+                    wait_time = min(2 ** retry_count, 16)
+                    if debug:
+                        print(f"[WORKER] {worker_info} - Request error on {path}, retrying in {wait_time}s: {str(e)}")
+                    time.sleep(wait_time)
+                except Exception as e:
+                    # Other unexpected errors
+                    retry_count += 1
+                    if retry_count >= max_retries:
+                        if debug:
+                            print(f"[WORKER] {worker_info} - Unexpected error after {max_retries} retries for {path}: {str(e)}")
+                        return
+                    wait_time = min(2 ** retry_count, 16)
+                    time.sleep(wait_time)
 
         # Process the user - scan DBFS first
         dbfs_file_count = 0
@@ -1255,12 +1313,29 @@ def process_user_on_worker(user_data: str) -> Dict:
                     if response.status_code == 404:
                         return
                     elif response.status_code == 429:
+                        # Rate limited - exponential backoff
                         retry_count += 1
                         wait_time = min(2 ** retry_count, 32)
+                        if debug:
+                            print(f"[WORKER] {worker_info} - Rate limited (429) on {path}, retrying in {wait_time}s (attempt {retry_count}/{max_retries})")
                         time.sleep(wait_time)
                         rate_limit_delay = min(rate_limit_delay * 1.5, 1.0)
                         continue
+                    elif response.status_code in [500, 503]:
+                        # Server errors - retry with backoff
+                        retry_count += 1
+                        if retry_count >= max_retries:
+                            if debug:
+                                print(f"[WORKER] {worker_info} - Server error {response.status_code} on {path}, max retries reached")
+                            return
+                        wait_time = min(2 ** retry_count, 16)
+                        if debug:
+                            print(f"[WORKER] {worker_info} - Server error {response.status_code} on {path}, retrying in {wait_time}s")
+                        time.sleep(wait_time)
+                        continue
                     elif response.status_code != 200:
+                        if debug:
+                            print(f"[WORKER] {worker_info} - Workspace API returned {response.status_code} for {path}")
                         return
 
                     data = response.json()
@@ -1279,11 +1354,26 @@ def process_user_on_worker(user_data: str) -> Dict:
 
                     return
 
-                except Exception:
+                except requests.exceptions.RequestException as e:
+                    # Network/connection errors - retry with backoff
                     retry_count += 1
                     if retry_count >= max_retries:
+                        if debug:
+                            print(f"[WORKER] {worker_info} - Request failed after {max_retries} retries for {path}: {str(e)}")
                         return
-                    time.sleep(min(2 ** retry_count, 16))
+                    wait_time = min(2 ** retry_count, 16)
+                    if debug:
+                        print(f"[WORKER] {worker_info} - Request error on {path}, retrying in {wait_time}s: {str(e)}")
+                    time.sleep(wait_time)
+                except Exception as e:
+                    # Other unexpected errors
+                    retry_count += 1
+                    if retry_count >= max_retries:
+                        if debug:
+                            print(f"[WORKER] {worker_info} - Unexpected error after {max_retries} retries for {path}: {str(e)}")
+                        return
+                    wait_time = min(2 ** retry_count, 16)
+                    time.sleep(wait_time)
 
         # Scan Workspace (always, to cumulate with DBFS)
         if debug:
