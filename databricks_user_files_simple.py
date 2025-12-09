@@ -1147,6 +1147,7 @@ def process_user_on_worker(user_data: str) -> Dict:
         workspace_url = data["workspace_url"]
         token = data["token"]
         debug = data.get("debug", False)
+        dbfs_only = data.get("dbfs_only", False)  # Skip Workspace if True
 
         # Get worker/executor information with hostname for better identification
         worker_info = "Unknown"
@@ -1290,106 +1291,110 @@ def process_user_on_worker(user_data: str) -> Dict:
         if debug and dbfs_file_count > 0:
             print(f"[WORKER] {worker_info} - [DBFS] Found {dbfs_file_count} files for {username}")
 
-        # Now scan Workspace API (always, not just as fallback)
+        # Scan Workspace API (unless dbfs_only flag is set)
         workspace_file_count = 0
         workspace_dir_count = 0
 
-        def list_workspace_recursive(path: str, depth: int = 0, max_depth: int = 10):
-            nonlocal workspace_file_count, workspace_dir_count, request_count, rate_limit_delay
+        if not dbfs_only:
+            # Only scan Workspace if not in DBFS-only mode
+            def list_workspace_recursive(path: str, depth: int = 0, max_depth: int = 10):
+                nonlocal workspace_file_count, workspace_dir_count, request_count, rate_limit_delay
 
-            if depth > max_depth:
-                return
+                if depth > max_depth:
+                    return
 
-            max_retries = 5
-            retry_count = 0
+                max_retries = 5
+                retry_count = 0
 
-            while retry_count < max_retries:
-                try:
-                    if request_count > 0:
-                        time.sleep(rate_limit_delay)
+                while retry_count < max_retries:
+                    try:
+                        if request_count > 0:
+                            time.sleep(rate_limit_delay)
 
-                    request_count += 1
+                        request_count += 1
 
-                    url = f"{workspace_url}/api/2.0/workspace/list"
-                    response = requests.get(
-                        url,
-                        headers=headers,
-                        json={"path": path},
-                        timeout=30
-                    )
+                        url = f"{workspace_url}/api/2.0/workspace/list"
+                        response = requests.get(
+                            url,
+                            headers=headers,
+                            json={"path": path},
+                            timeout=30
+                        )
 
-                    if response.status_code == 404:
+                        if response.status_code == 404:
+                            return
+                        elif response.status_code == 429:
+                            # Rate limited - exponential backoff
+                            retry_count += 1
+                            wait_time = min(2 ** retry_count, 32)
+                            if debug:
+                                print(f"[WORKER] {worker_info} - Rate limited (429) on {path}, retrying in {wait_time}s (attempt {retry_count}/{max_retries})")
+                            time.sleep(wait_time)
+                            rate_limit_delay = min(rate_limit_delay * 1.5, 1.0)
+                            continue
+                        elif response.status_code in [500, 503]:
+                            # Server errors - retry with backoff
+                            retry_count += 1
+                            if retry_count >= max_retries:
+                                if debug:
+                                    print(f"[WORKER] {worker_info} - Server error {response.status_code} on {path}, max retries reached")
+                                return
+                            wait_time = min(2 ** retry_count, 16)
+                            if debug:
+                                print(f"[WORKER] {worker_info} - Server error {response.status_code} on {path}, retrying in {wait_time}s")
+                            time.sleep(wait_time)
+                            continue
+                        elif response.status_code != 200:
+                            if debug:
+                                print(f"[WORKER] {worker_info} - Workspace API returned {response.status_code} for {path}")
+                            return
+
+                        data = response.json()
+                        objects = data.get("objects", [])
+
+                        for obj in objects:
+                            object_path = obj.get("path", "")
+                            object_type = obj.get("object_type", "")
+
+                            if object_type == "DIRECTORY":
+                                workspace_dir_count += 1
+                                list_workspace_recursive(object_path, depth + 1, max_depth)
+                            else:
+                                # NOTEBOOK, LIBRARY, FILE, etc.
+                                workspace_file_count += 1
+
                         return
-                    elif response.status_code == 429:
-                        # Rate limited - exponential backoff
-                        retry_count += 1
-                        wait_time = min(2 ** retry_count, 32)
-                        if debug:
-                            print(f"[WORKER] {worker_info} - Rate limited (429) on {path}, retrying in {wait_time}s (attempt {retry_count}/{max_retries})")
-                        time.sleep(wait_time)
-                        rate_limit_delay = min(rate_limit_delay * 1.5, 1.0)
-                        continue
-                    elif response.status_code in [500, 503]:
-                        # Server errors - retry with backoff
+
+                    except requests.exceptions.RequestException as e:
+                        # Network/connection errors - retry with backoff
                         retry_count += 1
                         if retry_count >= max_retries:
                             if debug:
-                                print(f"[WORKER] {worker_info} - Server error {response.status_code} on {path}, max retries reached")
+                                print(f"[WORKER] {worker_info} - Request failed after {max_retries} retries for {path}: {str(e)}")
                             return
                         wait_time = min(2 ** retry_count, 16)
                         if debug:
-                            print(f"[WORKER] {worker_info} - Server error {response.status_code} on {path}, retrying in {wait_time}s")
+                            print(f"[WORKER] {worker_info} - Request error on {path}, retrying in {wait_time}s: {str(e)}")
                         time.sleep(wait_time)
-                        continue
-                    elif response.status_code != 200:
-                        if debug:
-                            print(f"[WORKER] {worker_info} - Workspace API returned {response.status_code} for {path}")
-                        return
+                    except Exception as e:
+                        # Other unexpected errors
+                        retry_count += 1
+                        if retry_count >= max_retries:
+                            if debug:
+                                print(f"[WORKER] {worker_info} - Unexpected error after {max_retries} retries for {path}: {str(e)}")
+                            return
+                        wait_time = min(2 ** retry_count, 16)
+                        time.sleep(wait_time)
 
-                    data = response.json()
-                    objects = data.get("objects", [])
+            # Scan Workspace (only if not dbfs_only)
+            if debug:
+                print(f"[WORKER] {worker_info} - [WORKSPACE] Scanning workspace files for {username}...")
+            list_workspace_recursive(home_path)
 
-                    for obj in objects:
-                        object_path = obj.get("path", "")
-                        object_type = obj.get("object_type", "")
-
-                        if object_type == "DIRECTORY":
-                            workspace_dir_count += 1
-                            list_workspace_recursive(object_path, depth + 1, max_depth)
-                        else:
-                            # NOTEBOOK, LIBRARY, FILE, etc.
-                            workspace_file_count += 1
-
-                    return
-
-                except requests.exceptions.RequestException as e:
-                    # Network/connection errors - retry with backoff
-                    retry_count += 1
-                    if retry_count >= max_retries:
-                        if debug:
-                            print(f"[WORKER] {worker_info} - Request failed after {max_retries} retries for {path}: {str(e)}")
-                        return
-                    wait_time = min(2 ** retry_count, 16)
-                    if debug:
-                        print(f"[WORKER] {worker_info} - Request error on {path}, retrying in {wait_time}s: {str(e)}")
-                    time.sleep(wait_time)
-                except Exception as e:
-                    # Other unexpected errors
-                    retry_count += 1
-                    if retry_count >= max_retries:
-                        if debug:
-                            print(f"[WORKER] {worker_info} - Unexpected error after {max_retries} retries for {path}: {str(e)}")
-                        return
-                    wait_time = min(2 ** retry_count, 16)
-                    time.sleep(wait_time)
-
-        # Scan Workspace (always, to cumulate with DBFS)
-        if debug:
-            print(f"[WORKER] {worker_info} - [WORKSPACE] Scanning workspace files for {username}...")
-        list_workspace_recursive(home_path)
-
-        if debug and workspace_file_count > 0:
-            print(f"[WORKER] {worker_info} - [WORKSPACE] Found {workspace_file_count} files for {username}")
+            if debug and workspace_file_count > 0:
+                print(f"[WORKER] {worker_info} - [WORKSPACE] Found {workspace_file_count} files for {username}")
+        elif debug:
+            print(f"[WORKER] {worker_info} - [WORKSPACE] Skipping workspace scan (--dbfs-only mode)")
 
         # Cumulate results from both sources
         file_count = dbfs_file_count + workspace_file_count
@@ -1460,7 +1465,7 @@ def process_user_on_worker(user_data: str) -> Dict:
 
 def process_multiple_users_parallel(usernames: List[str], workspace_url: str, token: str,
                                     cluster_id: Optional[str] = None, debug: bool = False,
-                                    resume: bool = False) -> List[Dict]:
+                                    resume: bool = False, dbfs_only: bool = False) -> List[Dict]:
     """
     Process multiple users in parallel using Spark cluster workers.
     This distributes the work across all available workers for maximum speed.
@@ -1472,6 +1477,7 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
         cluster_id: Cluster ID (required for parallel processing)
         debug: Enable debug output
         resume: Resume from checkpoint file if it exists
+        dbfs_only: If True, scan only DBFS (skip Workspace file system)
 
     Returns:
         List of result dictionaries for each user
@@ -1624,14 +1630,17 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
                 "username": username,
                 "workspace_url": workspace_url,
                 "token": token,
-                "debug": debug
+                "debug": debug,
+                "dbfs_only": dbfs_only
             }
             user_data_list.append(json.dumps(user_data))
 
         if debug:
             print(f"Processing {len(user_data_list)} users across Spark workers...")
-            print(f"Each worker will independently scan assigned users using DBFS API")
-            print(f"Method: REST API calls to /api/2.0/dbfs/list (no /dbfs mount required)")
+            scan_mode = "DBFS only" if dbfs_only else "DBFS + Workspace"
+            print(f"Scan mode: {scan_mode}")
+            print(f"Each worker will independently scan assigned users using REST APIs")
+            print(f"Method: REST API calls to /api/2.0/dbfs/list" + ("" if dbfs_only else " and /api/2.0/workspace/list"))
             print(f"\nUsers to be distributed:")
             for idx, username in enumerate(usernames, 1):
                 print(f"  {idx}. {username}")
@@ -2007,7 +2016,7 @@ def process_multiple_users(usernames: List[str], workspace_url: Optional[str] = 
                           token: Optional[str] = None, cluster_id: Optional[str] = None,
                           profile: Optional[str] = None, debug: bool = False,
                           output_csv: Optional[str] = None, parallel: bool = True,
-                          resume: bool = False) -> List[Dict]:
+                          resume: bool = False, dbfs_only: bool = False) -> List[Dict]:
     """
     Process multiple users and return results.
     Automatically uses parallel processing if cluster_id is provided, otherwise sequential.
@@ -2022,6 +2031,7 @@ def process_multiple_users(usernames: List[str], workspace_url: Optional[str] = 
         output_csv: Optional CSV output file path
         resume: Resume from checkpoint file if available
         parallel: If True and cluster_id provided, use parallel processing (default: True)
+        dbfs_only: If True, scan only DBFS (skip Workspace file system)
 
     Returns:
         List of result dictionaries for each user
@@ -2047,7 +2057,8 @@ def process_multiple_users(usernames: List[str], workspace_url: Optional[str] = 
             token=token,
             cluster_id=cluster_id,
             debug=debug,
-            resume=resume
+            resume=resume,
+            dbfs_only=dbfs_only
         )
 
         # If parallel processing succeeded, skip sequential
@@ -2250,6 +2261,7 @@ Performance Note:
     parser.add_argument("--output", "-o", help="Output CSV file path for results")
     parser.add_argument("--no-parallel", action="store_true", help="Disable parallel processing (force sequential)")
     parser.add_argument("--resume", action="store_true", help="Resume from checkpoint file if available (.checkpoint_progress.json)")
+    parser.add_argument("--dbfs-only", action="store_true", help="Scan only DBFS (skip Workspace file system)")
     parser.add_argument("--debug", action="store_true", help="Enable debug output")
 
     args = parser.parse_args()
@@ -2333,7 +2345,8 @@ Performance Note:
                 debug=args.debug,
                 output_csv=args.output,
                 parallel=not args.no_parallel,  # Enable parallel by default unless --no-parallel
-                resume=args.resume  # Resume from checkpoint if requested
+                resume=args.resume,  # Resume from checkpoint if requested
+                dbfs_only=args.dbfs_only  # Scan only DBFS if requested
             )
 
         # Record end time and calculate duration
