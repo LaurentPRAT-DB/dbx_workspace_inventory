@@ -580,6 +580,33 @@ python databricks_user_list.py --profile PROD --max-users 10 --output test_users
 python databricks_user_files_simple.py --users-file test_users.csv --profile PROD --cluster-id ... --output test_results.csv
 ```
 
+### 5. Reliability for Large Workspaces
+
+The tool includes automatic error recovery for processing 1000+ users:
+
+**Automatic Retry Logic:**
+- API rate limits (429) → Exponential backoff up to 32 seconds
+- Server errors (500, 503) → Automatic retry with backoff
+- Network errors → Connection retry with exponential backoff
+- Adaptive delays → Automatically slows down when under pressure
+
+**Checkpoint & Resume:**
+For very long runs that may timeout after 30-60 minutes:
+```bash
+# Initial run (may timeout after processing 50/100 users)
+python databricks_user_files_simple.py --users-file users.csv --profile PROD --cluster-id ABC123 --output results.csv
+
+# Resume from checkpoint if timeout occurs
+python databricks_user_files_simple.py --users-file users.csv --profile PROD --cluster-id ABC123 --output results.csv --resume
+```
+
+Progress is saved automatically to `.checkpoint_progress.json` after each user completion.
+
+**Best Practices:**
+- Use `--debug` flag to monitor retry behavior
+- Trust the automatic retry logic - it will recover from transient issues
+- Use `--resume` for jobs processing 500+ users to handle potential timeouts
+
 ---
 
 ## Troubleshooting
