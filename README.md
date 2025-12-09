@@ -26,6 +26,7 @@ python databricks_user_files_simple.py \
 - **🔍 Dual File System Scanning** - Automatically scans both DBFS (data files) and Workspace (notebooks) for every user
 - **➕ Cumulative Results** - Combines file counts and sizes from both DBFS and Workspace into total inventory
 - **💾 Checkpoint & Resume** - Automatically saves progress; resume from where you left off after timeouts
+- **🛡️ Robust Error Handling** - Automatic retry with exponential backoff for rate limits (429), server errors (500/503), and network issues
 - **📊 Comprehensive Results** - Tracks file count, size, source, and status for each user
 - **🎯 Real-Time Progress** - See live updates as workers process users in parallel
 - **📈 Scalable** - Efficiently handles 1000+ users with proper cluster sizing
@@ -605,12 +606,33 @@ databricks clusters get --cluster-id YOUR_CLUSTER_ID
 databricks clusters start --cluster-id YOUR_CLUSTER_ID
 ```
 
-### "Rate limited (429)" errors
+### "Rate limited (429)" or Server Errors (500, 503)
 
-**Solution:** The tool automatically handles rate limiting with exponential backoff. If you see many 429 errors:
-- Reduce concurrent processing (use fewer workers)
-- Add delays between batches
-- The tool will automatically retry and slow down
+**Good News:** The tool automatically handles these errors with robust retry logic!
+
+**Automatic Error Handling:**
+- **Rate Limiting (429)**: Exponential backoff up to 32 seconds, then retry
+- **Server Errors (500, 503)**: Automatic retry with backoff up to 16 seconds
+- **Network Errors**: Connection timeout/DNS failure retry with backoff
+- **Adaptive Delays**: Request spacing automatically increases from 50ms to 1 second when needed
+- **Max Retries**: Up to 5 attempts per request with smart backoff
+
+**Debug Output:**
+Enable `--debug` to see retry behavior in action:
+```bash
+python databricks_user_files_simple.py --users-file users.csv --profile PROD --cluster-id ABC123 --debug
+```
+
+Example debug output:
+```
+Rate limited (429) on /Users/john@example.com, retrying in 4s (attempt 2/5)
+Server error 503 on /Users/jane@example.com/data, retrying in 2s
+```
+
+**If you still see persistent errors:**
+- Reduce concurrent processing (use fewer cluster workers)
+- The issue is likely temporary - the tool will automatically recover
+- Check Databricks workspace health status
 
 ### "Python version mismatch"
 
