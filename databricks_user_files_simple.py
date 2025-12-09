@@ -1733,23 +1733,44 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
             print(f"{'='*80}\n")
         else:
             print("Distributing work to cluster workers...")
+            print("All workers will process their partitions in parallel...")
 
         result_df = users_df.mapInPandas(process_users_batch, schema=output_schema)
 
-        # Collect results with progress output in debug mode
-        # Save checkpoint incrementally to enable resume on failure
+        # Collect results - use .collect() to ensure true parallel execution
+        # Save checkpoint after collection to enable resume on failure
         checkpoint_file = ".checkpoint_progress.json"
 
         if debug:
-            print("Processing users across workers (showing results as they complete)...\n")
-            print(f"💾 Checkpoint file: {checkpoint_file} (progress saved incrementally)\n")
+            print("Executing parallel processing across all cluster workers...\n")
+            print(f"💾 Checkpoint file: {checkpoint_file} (will be saved after completion)\n")
 
         results = []
         processed_count = 0
 
-        # Use toLocalIterator for incremental result streaming
+        # Use .collect() to trigger full parallel execution on cluster
+        # All workers process their partitions simultaneously
         try:
-            for row in result_df.toLocalIterator():
+            if debug:
+                print(f"{'='*80}")
+                print(f"TRIGGERING PARALLEL EXECUTION")
+                print(f"{'='*80}")
+                print(f"Submitting {len(usernames)} users across {actual_partitions} partitions to cluster...")
+                print(f"All workers will start processing simultaneously...")
+                print(f"{'='*80}\n")
+            else:
+                print(f"\nExecuting parallel processing for {len(usernames)} users...")
+
+            # Collect all results at once - this triggers true parallel execution
+            collected_rows = result_df.collect()
+
+            if debug:
+                print(f"✓ Parallel execution completed! Processing {len(collected_rows)} results...\n")
+            else:
+                print(f"✓ Parallel execution completed! Collected {len(collected_rows)} results.\n")
+
+            # Process collected results
+            for row in collected_rows:
                 processed_count += 1
                 result = {
                     "username": row.username,
@@ -1765,20 +1786,6 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
                     "file_source": row.file_source
                 }
                 results.append(result)
-
-                # Save checkpoint after each result (enables resume on failure)
-                try:
-                    with open(checkpoint_file, 'w') as f:
-                        json.dump({
-                            "total_users": len(usernames),
-                            "processed_count": processed_count,
-                            "last_completed_user": result["username"],
-                            "timestamp": datetime.now().isoformat(),
-                            "results": results
-                        }, f, indent=2)
-                except Exception as checkpoint_error:
-                    if debug:
-                        print(f"Warning: Could not save checkpoint: {checkpoint_error}")
 
                 if debug:
                     # Show per-user progress with worker and timing info
@@ -1798,32 +1805,39 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
             if debug:
                 print()  # Empty line after all users
 
-            # Delete checkpoint file on successful completion
+            # Save final checkpoint after successful completion
+            # This allows resume if subsequent steps fail
             try:
-                import os
-                if os.path.exists(checkpoint_file):
-                    os.remove(checkpoint_file)
-                    if debug:
-                        print(f"✓ Checkpoint file removed (processing completed successfully)\n")
-            except:
-                pass
+                with open(checkpoint_file, 'w') as f:
+                    json.dump({
+                        "total_users": len(usernames),
+                        "processed_count": processed_count,
+                        "last_completed_user": results[-1]["username"] if results else None,
+                        "timestamp": datetime.now().isoformat(),
+                        "results": results
+                    }, f, indent=2)
+                if debug:
+                    print(f"✓ Checkpoint saved: {checkpoint_file} ({len(results)} users)\n")
+            except Exception as checkpoint_error:
+                if debug:
+                    print(f"⚠️  Warning: Could not save checkpoint: {checkpoint_error}\n")
 
-        except Exception as stream_error:
-            # Handle streaming/timeout errors during result collection
-            error_msg = str(stream_error)
-            is_timeout = "INVALID_HANDLE" in error_msg or "OPERATION_ABANDONED" in error_msg or "abandoned" in error_msg.lower()
+        except Exception as collection_error:
+            # Handle timeout or other errors during parallel execution
+            error_msg = str(collection_error)
+            is_timeout = "INVALID_HANDLE" in error_msg or "OPERATION_ABANDONED" in error_msg or "abandoned" in error_msg.lower() or "timeout" in error_msg.lower()
 
             print(f"\n{'='*80}")
-            print(f"⚠️  PARALLEL PROCESSING INTERRUPTED")
+            print(f"⚠️  PARALLEL PROCESSING FAILED")
             print(f"{'='*80}")
-            print(f"Processed: {processed_count}/{len(usernames)} users before interruption")
-            print(f"Last completed: {results[-1]['username'] if results else 'None'}")
+            print(f"Error occurred during parallel execution on cluster")
             print(f"Error: {error_msg}")
             print(f"{'='*80}\n")
 
             if is_timeout:
                 print("This appears to be a timeout/session abandonment error.")
-                print("Long-running operations (>30-60 minutes) may be abandoned by the server.\n")
+                print("Long-running operations (>30-60 minutes) may be abandoned by the server.")
+                print("Note: With .collect(), entire batch must complete before timeout.\n")
 
             # Save partial results to checkpoint
             if results:
@@ -1865,28 +1879,6 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
 
             # Raise the error to be caught by outer exception handler
             raise
-
-        # Non-debug mode: collect all at once
-        if not debug:
-            print("Collecting results from workers...\n")
-            results_rows = result_df.collect()
-
-            # Convert to list of dicts
-            results = []
-            for row in results_rows:
-                results.append({
-                    "username": row.username,
-                    "file_count": int(row.file_count or 0),
-                    "total_size": int(row.total_size or 0),
-                    "dir_count": int(row.dir_count or 0),
-                    "status": row.status,
-                    "error": row.error,
-                    "worker_id": row.worker_id,
-                    "start_time": row.start_time,
-                    "end_time": row.end_time,
-                    "duration_seconds": float(row.duration_seconds or 0),
-                    "file_source": row.file_source
-                })
 
         # Calculate parallel processing duration
         parallel_end_time = datetime.now()
