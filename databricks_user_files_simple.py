@@ -1801,15 +1801,15 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
                         print(f"[PARTITION START] Partition {partition_id} on {executor_id} - {batch_start_time}")
                         print(f"  Processing {len(batch_users)} user(s): {user_list}")
 
-                # Process each user in this batch
-                for user_data_str in pdf['user_data']:
-                    result = process_user_on_worker(user_data_str)
-                    rows.append(result)
+                    # Process each user in this batch
+                    for user_data_str in pdf['user_data']:
+                        result = process_user_on_worker(user_data_str)
+                        rows.append(result)
 
-                if rows:
-                    yield pd.DataFrame(rows)
-                else:
-                    yield pd.DataFrame(columns=["username", "file_count", "total_size", "dir_count", "status", "error"])
+                    if rows:
+                        yield pd.DataFrame(rows)
+                    else:
+                        yield pd.DataFrame(columns=["username", "file_count", "total_size", "dir_count", "status", "error"])
 
             # Execute parallel processing
             if debug:
