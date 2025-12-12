@@ -63,3 +63,5 @@ results_*
 # Checkpoint files
 *checkpoint_progress.json
 
+# Deprecated/legacy files (keep locally but don't track)
+databricks_user_files.py
