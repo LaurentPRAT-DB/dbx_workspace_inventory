@@ -65,3 +65,4 @@ results_*
 
 # Deprecated/legacy files (keep locally but don't track)
 databricks_user_files.py
+databricks_user_files_parallel_notebook.py
