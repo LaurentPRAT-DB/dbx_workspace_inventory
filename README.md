@@ -154,9 +154,11 @@ Options:
   --workspace-url URL      Workspace URL (overrides profile)
   --token TOKEN            Access token (overrides profile)
   --cluster-id ID          Cluster ID (enables parallel processing)
+  --chunk-size N           Users per chunk in parallel mode (default: 100)
   --output FILE            Output CSV file path
   --resume                 Resume from checkpoint (.checkpoint_progress.json)
   --no-parallel            Force sequential processing
+  --dbfs-only              Scan only DBFS (skip Workspace)
   --debug                  Show detailed progress and retry attempts
 ```
 
@@ -164,9 +166,76 @@ Options:
 
 ## Advanced Features
 
+### Chunked Processing (Prevents Timeouts)
+
+**NEW:** The tool now automatically processes users in chunks to prevent timeout errors on large batches.
+
+**How it works:**
+- Large user lists are split into smaller chunks (default: 100 users per chunk)
+- Each chunk is processed independently and checkpointed
+- Prevents `OPERATION_ABANDONED` timeout errors on 500+ user jobs
+
+**Default behavior (automatic chunking):**
+```bash
+# Processes 500 users in 5 chunks of 100 each
+python databricks_user_files_simple.py \
+  --users-file users.csv \
+  --profile PROD \
+  --cluster-id ABC123
+```
+
+**Adjust chunk size if needed:**
+```bash
+# Use smaller chunks if processing is very slow
+python databricks_user_files_simple.py \
+  --users-file users.csv \
+  --profile PROD \
+  --cluster-id ABC123 \
+  --chunk-size 50
+
+# Use larger chunks if processing is fast
+python databricks_user_files_simple.py \
+  --users-file users.csv \
+  --profile PROD \
+  --cluster-id ABC123 \
+  --chunk-size 200
+```
+
+**Progress reporting:**
+```
+================================================================================
+CHUNKED PROCESSING STRATEGY
+================================================================================
+Total users: 500
+Chunk size: 100 users per chunk
+Number of chunks: 5
+================================================================================
+
+================================================================================
+PROCESSING CHUNK 1/5
+================================================================================
+Users in this chunk: 100
+Progress: 0/500 users completed
+...
+
+✓ Chunk 1/5 completed in 0:15:30
+✓ Checkpoint saved: 100/500 users completed
+
+================================================================================
+PROCESSING CHUNK 2/5
+================================================================================
+...
+```
+
+**Benefits:**
+- ✅ No timeout errors on large batches
+- ✅ Process unlimited users (1000+)
+- ✅ Incremental progress visibility
+- ✅ Automatic checkpointing per chunk
+
 ### Checkpoint & Resume
 
-For large workspaces (500+ users), jobs may timeout after 30-60 minutes. The tool automatically saves progress after each user:
+The tool automatically saves progress after each chunk completes. If a job is interrupted, resume from the last checkpoint:
 
 ```bash
 # Initial run (may timeout after 50 users)
@@ -210,7 +279,9 @@ python databricks_user_files_simple.py \
 
 ### Batch Processing
 
-For very large workspaces, split into batches:
+**Note:** With automatic chunked processing, manual batch splitting is rarely needed. The tool handles large workspaces automatically.
+
+If you still need manual batch processing (e.g., for organizational reasons):
 
 ```bash
 # Split user list
@@ -221,6 +292,8 @@ tail -n +501 users.csv > batch2.csv
 python databricks_user_files_simple.py --users-file batch1.csv --profile PROD --cluster-id ... --output results1.csv
 python databricks_user_files_simple.py --users-file batch2.csv --profile PROD --cluster-id ... --output results2.csv
 ```
+
+**Recommendation:** Use `--chunk-size` instead of manual batching for better automatic checkpointing.
 
 ---
 
@@ -376,14 +449,35 @@ databricks clusters start --cluster-id YOUR_CLUSTER_ID
 
 **What it means:** Long-running parallel jobs (>30-60 min) can timeout due to inactivity limits.
 
-**Solution:** Use the `--resume` flag:
+**Solution 1 - Automatic chunking (RECOMMENDED):**
+
+The tool now automatically processes users in chunks (default: 100 users per chunk) to prevent timeouts. This works automatically - no changes needed!
+
+If you still get timeouts, use a smaller chunk size:
 
 ```bash
-# Job timed out after processing 50/100 users
-python databricks_user_files_simple.py --users-file users.csv --profile PROD --cluster-id ABC123 --resume
+# Use smaller chunks for very slow processing
+python databricks_user_files_simple.py \
+  --users-file users.csv \
+  --profile PROD \
+  --cluster-id ABC123 \
+  --chunk-size 50
 ```
 
-The tool automatically checkpoints progress. Resume will skip completed users and continue from where it stopped.
+**Solution 2 - Resume from checkpoint:**
+
+If a chunk still times out, resume from the last completed chunk:
+
+```bash
+# Resume after timeout
+python databricks_user_files_simple.py \
+  --users-file users.csv \
+  --profile PROD \
+  --cluster-id ABC123 \
+  --resume
+```
+
+The tool automatically checkpoints progress after each chunk completes.
 
 ### Empty results or "No files found"
 
@@ -416,16 +510,23 @@ Check the `file_source` column to see which file system(s) had files.
    python databricks_user_files_simple.py --users-file users.csv --profile PROD --cluster-id ... --debug
    ```
 
-4. **Use resume for 500+ users**
+4. **Automatic chunking prevents timeouts**
+   - Tool automatically processes in chunks of 100 users
+   - Prevents timeout errors on large batches (500+ users)
+   - Adjust with `--chunk-size` if needed (smaller for slow processing, larger for fast)
+   - Each chunk is automatically checkpointed
+
+5. **Use resume if interrupted**
    ```bash
-   # Long-running jobs may timeout - resume is your friend
+   # Job interrupted? Resume from last completed chunk
    python databricks_user_files_simple.py --users-file users.csv --profile PROD --cluster-id ... --resume
    ```
 
-5. **Trust the automatic retry logic**
+6. **Trust the automatic retry logic**
    - Rate limits (429) are handled automatically
    - Server errors (500/503) retry automatically
    - Network errors retry automatically
+   - Chunking prevents timeout errors automatically
    - No manual intervention needed
 
 ---
@@ -463,13 +564,16 @@ username,file_count,total_size,total_size_gb,status,file_source,error
 # Export users
 python databricks_user_list.py --profile PROD --output users.csv
 
-# Parallel scan (FAST)
+# Parallel scan (FAST) - automatic chunking prevents timeouts
 python databricks_user_files_simple.py --users-file users.csv --profile PROD --cluster-id ABC123 --output results.csv
+
+# Parallel scan with custom chunk size
+python databricks_user_files_simple.py --users-file users.csv --profile PROD --cluster-id ABC123 --chunk-size 50 --output results.csv
 
 # Sequential scan (no cluster)
 python databricks_user_files_simple.py --users-file users.csv --profile PROD --output results.csv
 
-# Resume after timeout
+# Resume after interruption
 python databricks_user_files_simple.py --users-file users.csv --profile PROD --cluster-id ABC123 --resume
 
 # Debug mode
@@ -477,6 +581,9 @@ python databricks_user_files_simple.py --users-file users.csv --profile PROD --c
 
 # Single user
 python databricks_user_files_simple.py user@example.com --profile PROD
+
+# DBFS only (skip Workspace scanning)
+python databricks_user_files_simple.py --users-file users.csv --profile PROD --cluster-id ABC123 --dbfs-only
 ```
 
 ---
