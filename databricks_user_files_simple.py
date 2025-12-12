@@ -1465,10 +1465,13 @@ def process_user_on_worker(user_data: str) -> Dict:
 
 def process_multiple_users_parallel(usernames: List[str], workspace_url: str, token: str,
                                     cluster_id: Optional[str] = None, debug: bool = False,
-                                    resume: bool = False, dbfs_only: bool = False) -> List[Dict]:
+                                    resume: bool = False, dbfs_only: bool = False, chunk_size: int = 100) -> List[Dict]:
     """
     Process multiple users in parallel using Spark cluster workers.
     This distributes the work across all available workers for maximum speed.
+
+    To avoid timeouts on large batches, users are automatically processed in chunks.
+    Each chunk is processed and checkpointed before moving to the next chunk.
 
     Args:
         usernames: List of usernames to process
@@ -1478,6 +1481,7 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
         debug: Enable debug output
         resume: Resume from checkpoint file if it exists
         dbfs_only: If True, scan only DBFS (skip Workspace file system)
+        chunk_size: Number of users to process per chunk (default: 100, helps avoid timeouts)
 
     Returns:
         List of result dictionaries for each user
@@ -1534,6 +1538,21 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
     elif resume:
         print(f"⚠️  Resume requested but no checkpoint file found: {checkpoint_file}")
         print(f"Starting fresh processing of all {len(usernames)} users\n")
+
+    # Split users into chunks to avoid timeout on large batches
+    total_users = len(usernames)
+    num_chunks = (total_users + chunk_size - 1) // chunk_size  # Ceiling division
+
+    if num_chunks > 1:
+        print(f"\n{'='*80}")
+        print(f"CHUNKED PROCESSING STRATEGY")
+        print(f"{'='*80}")
+        print(f"Total users: {total_users}")
+        print(f"Chunk size: {chunk_size} users per chunk")
+        print(f"Number of chunks: {num_chunks}")
+        print(f"This prevents timeouts by processing in smaller batches.")
+        print(f"Each chunk will be checkpointed before moving to the next.")
+        print(f"{'='*80}\n")
 
     try:
         from pyspark.sql import SparkSession
@@ -1623,141 +1642,156 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
             spark = SparkSession.builder.getOrCreate()
             num_workers = None
 
-        # Prepare user data
-        user_data_list = []
-        for username in usernames:
-            user_data = {
-                "username": username,
-                "workspace_url": workspace_url,
-                "token": token,
-                "debug": debug,
-                "dbfs_only": dbfs_only
-            }
-            user_data_list.append(json.dumps(user_data))
+        # Process users in chunks to avoid timeout
+        all_results = []
+        chunks = [usernames[i:i + chunk_size] for i in range(0, len(usernames), chunk_size)]
 
-        if debug:
-            print(f"Processing {len(user_data_list)} users across Spark workers...")
-            scan_mode = "DBFS only" if dbfs_only else "DBFS + Workspace"
-            print(f"Scan mode: {scan_mode}")
-            print(f"Each worker will independently scan assigned users using REST APIs")
-            print(f"Method: REST API calls to /api/2.0/dbfs/list" + ("" if dbfs_only else " and /api/2.0/workspace/list"))
-            print(f"\nUsers to be distributed:")
-            for idx, username in enumerate(usernames, 1):
-                print(f"  {idx}. {username}")
-            print()
+        for chunk_idx, chunk_usernames in enumerate(chunks, 1):
+            chunk_start_time = datetime.now()
 
-        # Create DataFrame for parallel processing
-        # Strategy: Create optimal number of partitions based on cluster size and user count
-        # Each partition should have multiple users to reduce task overhead
-
-        # Determine optimal partitioning
-        try:
-            default_parallelism = int(spark.conf.get('spark.default.parallelism', '8'))
-        except:
-            default_parallelism = 8
-
-        if num_workers and num_workers > 0:
-            # Aim for 2-4 partitions per worker core for good load balancing
-            # Assuming 4 cores per worker (typical for Standard_DS3_v2)
-            estimated_cores = num_workers * 4
-            num_partitions = min(estimated_cores * 2, len(user_data_list), 200)
-        else:
-            # Use default parallelism * 2 for good distribution
-            num_partitions = min(default_parallelism * 2, len(user_data_list), 200)
-
-        # Ensure at least 1 partition
-        num_partitions = max(1, num_partitions)
-
-        # Create DataFrame with explicit number of partitions
-        # Use parallelize-like approach: distribute users across partitions upfront
-        users_per_partition = max(1, len(user_data_list) // num_partitions)
-
-        if debug:
             print(f"\n{'='*80}")
-            print(f"PARTITIONING STRATEGY")
+            print(f"PROCESSING CHUNK {chunk_idx}/{num_chunks}")
             print(f"{'='*80}")
-            print(f"Total users: {len(user_data_list)}")
-            print(f"Target partitions: {num_partitions}")
-            print(f"Users per partition: ~{users_per_partition}")
-            if num_workers:
-                print(f"Cluster workers: {num_workers}")
-                print(f"Expected distribution: Each worker will process ~{num_partitions // max(num_workers, 1)} partitions")
+            print(f"Users in this chunk: {len(chunk_usernames)}")
+            print(f"Progress: {len(all_results)}/{total_users} users completed")
+            print(f"Chunk start time: {chunk_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
             print(f"{'='*80}\n")
 
-        # Create DataFrame and explicitly repartition for parallel distribution
-        users_df = spark.createDataFrame([{"user_data": ud} for ud in user_data_list])
+            # Prepare user data for this chunk
+            user_data_list = []
+            for username in chunk_usernames:
+                user_data = {
+                    "username": username,
+                    "workspace_url": workspace_url,
+                    "token": token,
+                    "debug": debug,
+                    "dbfs_only": dbfs_only
+                }
+                user_data_list.append(json.dumps(user_data))
 
-        # Use repartition with explicit number to force redistribution across workers
-        users_df = users_df.repartition(num_partitions)
+            if debug:
+                print(f"Processing {len(user_data_list)} users in chunk {chunk_idx} across Spark workers...")
+                scan_mode = "DBFS only" if dbfs_only else "DBFS + Workspace"
+                print(f"Scan mode: {scan_mode}")
+                print(f"Each worker will independently scan assigned users using REST APIs")
+                print(f"Method: REST API calls to /api/2.0/dbfs/list" + ("" if dbfs_only else " and /api/2.0/workspace/list"))
+                print(f"\nUsers in chunk {chunk_idx}:")
+                for idx, username in enumerate(chunk_usernames, 1):
+                    print(f"  {idx}. {username}")
+                print()
 
-        # Set actual_partitions for later use
-        actual_partitions = num_partitions
+            # Create DataFrame for parallel processing
+            # Strategy: Create optimal number of partitions based on cluster size and user count
+            # Each partition should have multiple users to reduce task overhead
 
-        # Define output schema
-        output_schema = StructType([
-            StructField("username", StringType(), True),
-            StructField("file_count", LongType(), True),
-            StructField("total_size", LongType(), True),
-            StructField("dir_count", LongType(), True),
-            StructField("status", StringType(), True),
-            StructField("error", StringType(), True),
-            StructField("worker_id", StringType(), True),
-            StructField("start_time", StringType(), True),
-            StructField("end_time", StringType(), True),
-            StructField("duration_seconds", DoubleType(), True),
-            StructField("file_source", StringType(), True)  # 'dbfs' or 'workspace'
-        ])
-
-        # Process in parallel using mapInPandas
-        def process_users_batch(iterator):
-            import pandas as pd
-            import json
-            import os
-            from datetime import datetime
-
-            # Get worker/executor information
-            task_context = None
-            executor_id = "Unknown"
-            partition_id = "Unknown"
-
+            # Determine optimal partitioning
             try:
-                from pyspark import TaskContext
-                task_context = TaskContext.get()
-                if task_context:
-                    partition_id = task_context.partitionId()
-                    # Try to get actual executor ID (host + executor number)
-                    try:
-                        # In Databricks, this gives us the actual executor identifier
-                        import socket
-                        hostname = socket.gethostname()
-                        # Executor ID format: hostname-executor-N
-                        executor_id = f"{hostname[-8:]}-P{partition_id}"
-                    except:
-                        executor_id = f"Executor-P{partition_id}"
+                default_parallelism = int(spark.conf.get('spark.default.parallelism', '8'))
             except:
-                pass
+                default_parallelism = 8
 
-            for pdf in iterator:
-                rows = []
-                batch_users = []
+            if num_workers and num_workers > 0:
+                # Aim for 2-4 partitions per worker core for good load balancing
+                # Assuming 4 cores per worker (typical for Standard_DS3_v2)
+                estimated_cores = num_workers * 4
+                num_partitions = min(estimated_cores * 2, len(user_data_list), 200)
+            else:
+                # Use default parallelism * 2 for good distribution
+                num_partitions = min(default_parallelism * 2, len(user_data_list), 200)
 
-                # First, collect usernames in this batch for logging
-                for user_data_str in pdf['user_data']:
-                    try:
-                        data = json.loads(user_data_str)
-                        username = data.get("username", "unknown")
-                        batch_users.append(username)
-                    except:
-                        pass
+            # Ensure at least 1 partition
+            num_partitions = max(1, num_partitions)
 
-                # Log batch assignment if debug mode
-                if batch_users:
-                    debug_mode = False
-                    try:
-                        first_data = json.loads(pdf['user_data'].iloc[0])
-                        debug_mode = first_data.get("debug", False)
-                    except:
-                        pass
+            # Create DataFrame with explicit number of partitions
+            # Use parallelize-like approach: distribute users across partitions upfront
+            users_per_partition = max(1, len(user_data_list) // num_partitions)
+
+            if debug:
+                print(f"\n{'='*80}")
+                print(f"PARTITIONING STRATEGY")
+                print(f"{'='*80}")
+                print(f"Total users: {len(user_data_list)}")
+                print(f"Target partitions: {num_partitions}")
+                print(f"Users per partition: ~{users_per_partition}")
+                if num_workers:
+                    print(f"Cluster workers: {num_workers}")
+                    print(f"Expected distribution: Each worker will process ~{num_partitions // max(num_workers, 1)} partitions")
+                print(f"{'='*80}\n")
+
+            # Create DataFrame and explicitly repartition for parallel distribution
+            users_df = spark.createDataFrame([{"user_data": ud} for ud in user_data_list])
+
+            # Use repartition with explicit number to force redistribution across workers
+            users_df = users_df.repartition(num_partitions)
+
+            # Set actual_partitions for later use
+            actual_partitions = num_partitions
+
+            # Define output schema
+            output_schema = StructType([
+                StructField("username", StringType(), True),
+                StructField("file_count", LongType(), True),
+                StructField("total_size", LongType(), True),
+                StructField("dir_count", LongType(), True),
+                StructField("status", StringType(), True),
+                StructField("error", StringType(), True),
+                StructField("worker_id", StringType(), True),
+                StructField("start_time", StringType(), True),
+                StructField("end_time", StringType(), True),
+                StructField("duration_seconds", DoubleType(), True),
+                StructField("file_source", StringType(), True)  # 'dbfs' or 'workspace'
+            ])
+
+            # Process in parallel using mapInPandas
+            def process_users_batch(iterator):
+                import pandas as pd
+                import json
+                import os
+                from datetime import datetime
+
+                # Get worker/executor information
+                task_context = None
+                executor_id = "Unknown"
+                partition_id = "Unknown"
+
+                try:
+                    from pyspark import TaskContext
+                    task_context = TaskContext.get()
+                    if task_context:
+                        partition_id = task_context.partitionId()
+                        # Try to get actual executor ID (host + executor number)
+                        try:
+                            # In Databricks, this gives us the actual executor identifier
+                            import socket
+                            hostname = socket.gethostname()
+                            # Executor ID format: hostname-executor-N
+                            executor_id = f"{hostname[-8:]}-P{partition_id}"
+                        except:
+                            executor_id = f"Executor-P{partition_id}"
+                except:
+                    pass
+
+                for pdf in iterator:
+                    rows = []
+                    batch_users = []
+
+                    # First, collect usernames in this batch for logging
+                    for user_data_str in pdf['user_data']:
+                        try:
+                            data = json.loads(user_data_str)
+                            username = data.get("username", "unknown")
+                            batch_users.append(username)
+                        except:
+                            pass
+
+                    # Log batch assignment if debug mode
+                    if batch_users:
+                        debug_mode = False
+                        try:
+                            first_data = json.loads(pdf['user_data'].iloc[0])
+                            debug_mode = first_data.get("debug", False)
+                        except:
+                            pass
 
                     if debug_mode:
                         batch_start_time = datetime.now().strftime('%H:%M:%S')
@@ -1777,164 +1811,182 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
                 else:
                     yield pd.DataFrame(columns=["username", "file_count", "total_size", "dir_count", "status", "error"])
 
-        # Execute parallel processing
-        if debug:
-            print(f"{'='*80}")
-            print(f"STARTING PARALLEL EXECUTION")
-            print(f"{'='*80}")
-            print(f"Work distribution: {actual_partitions} partitions across cluster workers")
-            print(f"Execution mode: All partitions will start processing in parallel")
-            print(f"Workers will process their assigned partitions simultaneously")
-            print(f"{'='*80}\n")
-        else:
-            print("Distributing work to cluster workers...")
-            print("All workers will process their partitions in parallel...")
-
-        result_df = users_df.mapInPandas(process_users_batch, schema=output_schema)
-
-        # Collect results - use .collect() to ensure true parallel execution
-        # Save checkpoint after collection to enable resume on failure
-        checkpoint_file = ".checkpoint_progress.json"
-
-        if debug:
-            print("Executing parallel processing across all cluster workers...\n")
-            print(f"💾 Checkpoint file: {checkpoint_file} (will be saved after completion)\n")
-
-        results = []
-        processed_count = 0
-
-        # Use .collect() to trigger full parallel execution on cluster
-        # All workers process their partitions simultaneously
-        try:
+            # Execute parallel processing
             if debug:
                 print(f"{'='*80}")
-                print(f"TRIGGERING PARALLEL EXECUTION")
+                print(f"STARTING PARALLEL EXECUTION FOR CHUNK {chunk_idx}/{num_chunks}")
                 print(f"{'='*80}")
-                print(f"Submitting {len(usernames)} users across {actual_partitions} partitions to cluster...")
-                print(f"All workers will start processing simultaneously...")
+                print(f"Work distribution: {actual_partitions} partitions across cluster workers")
+                print(f"Execution mode: All partitions will start processing in parallel")
+                print(f"Workers will process their assigned partitions simultaneously")
                 print(f"{'='*80}\n")
             else:
-                print(f"\nExecuting parallel processing for {len(usernames)} users...")
+                print(f"Distributing chunk {chunk_idx}/{num_chunks} work to cluster workers...")
+                print("All workers will process their partitions in parallel...")
 
-            # Collect all results at once - this triggers true parallel execution
-            collected_rows = result_df.collect()
+            result_df = users_df.mapInPandas(process_users_batch, schema=output_schema)
 
-            if debug:
-                print(f"✓ Parallel execution completed! Processing {len(collected_rows)} results...\n")
-            else:
-                print(f"✓ Parallel execution completed! Collected {len(collected_rows)} results.\n")
-
-            # Process collected results
-            for row in collected_rows:
-                processed_count += 1
-                result = {
-                    "username": row.username,
-                    "file_count": int(row.file_count or 0),
-                    "total_size": int(row.total_size or 0),
-                    "dir_count": int(row.dir_count or 0),
-                    "status": row.status,
-                    "error": row.error,
-                    "worker_id": row.worker_id,
-                    "start_time": row.start_time,
-                    "end_time": row.end_time,
-                    "duration_seconds": float(row.duration_seconds or 0),
-                    "file_source": row.file_source
-                }
-                results.append(result)
-
-                if debug:
-                    # Show per-user progress with worker and timing info
-                    size_str = format_size(result["total_size"])
-                    status_icon = "✓" if result["status"] == "success" else ("⚠" if result["status"] == "empty" else "✗")
-                    error_msg = f" - {result['error']}" if result['error'] else ""
-                    worker_info = f"[{result['worker_id']}]" if result['worker_id'] else ""
-                    duration_info = f"({result['duration_seconds']:.1f}s)" if result['duration_seconds'] > 0 else ""
-                    timing_info = f"start={result['start_time']} end={result['end_time']}" if result['start_time'] else ""
-                    source_info = f"[{result['file_source'].upper()}]" if result.get('file_source') else ""
-
-                    print(f"  [{processed_count}/{len(usernames)}] {status_icon} {worker_info} {source_info} {result['username']}: "
-                          f"{result['file_count']} files ({size_str}) {duration_info}")
-                    if timing_info:
-                        print(f"      ↳ {timing_info}{error_msg}")
+            # Collect results for this chunk - use .collect() to ensure true parallel execution
+            # Save checkpoint after collection to enable resume on failure
+            checkpoint_file = ".checkpoint_progress.json"
 
             if debug:
-                print()  # Empty line after all users
+                print("Executing parallel processing across all cluster workers...\n")
+                print(f"💾 Checkpoint file: {checkpoint_file} (will be saved after chunk completion)\n")
 
-            # Save final checkpoint after successful completion
-            # This allows resume if subsequent steps fail
+            chunk_results = []
+            chunk_processed_count = 0
+
+            # Use .collect() to trigger full parallel execution on cluster
+            # All workers process their partitions simultaneously
             try:
-                with open(checkpoint_file, 'w') as f:
-                    json.dump({
-                        "total_users": len(usernames),
-                        "processed_count": processed_count,
-                        "last_completed_user": results[-1]["username"] if results else None,
-                        "timestamp": datetime.now().isoformat(),
-                        "results": results
-                    }, f, indent=2)
                 if debug:
-                    print(f"✓ Checkpoint saved: {checkpoint_file} ({len(results)} users)\n")
-            except Exception as checkpoint_error:
+                    print(f"{'='*80}")
+                    print(f"TRIGGERING PARALLEL EXECUTION FOR CHUNK {chunk_idx}/{num_chunks}")
+                    print(f"{'='*80}")
+                    print(f"Submitting {len(chunk_usernames)} users across {actual_partitions} partitions to cluster...")
+                    print(f"All workers will start processing simultaneously...")
+                    print(f"{'='*80}\n")
+                else:
+                    print(f"\nExecuting parallel processing for chunk {chunk_idx}/{num_chunks} ({len(chunk_usernames)} users)...")
+
+                # Collect all results for this chunk - this triggers true parallel execution
+                collected_rows = result_df.collect()
+
                 if debug:
-                    print(f"⚠️  Warning: Could not save checkpoint: {checkpoint_error}\n")
+                    print(f"✓ Chunk {chunk_idx}/{num_chunks} parallel execution completed! Processing {len(collected_rows)} results...\n")
+                else:
+                    print(f"✓ Chunk {chunk_idx}/{num_chunks} completed! Collected {len(collected_rows)} results.\n")
 
-        except Exception as collection_error:
-            # Handle timeout or other errors during parallel execution
-            error_msg = str(collection_error)
-            is_timeout = "INVALID_HANDLE" in error_msg or "OPERATION_ABANDONED" in error_msg or "abandoned" in error_msg.lower() or "timeout" in error_msg.lower()
+                # Process collected results for this chunk
+                for row in collected_rows:
+                    chunk_processed_count += 1
+                    result = {
+                        "username": row.username,
+                        "file_count": int(row.file_count or 0),
+                        "total_size": int(row.total_size or 0),
+                        "dir_count": int(row.dir_count or 0),
+                        "status": row.status,
+                        "error": row.error,
+                        "worker_id": row.worker_id,
+                        "start_time": row.start_time,
+                        "end_time": row.end_time,
+                        "duration_seconds": float(row.duration_seconds or 0),
+                        "file_source": row.file_source
+                    }
+                    chunk_results.append(result)
 
-            print(f"\n{'='*80}")
-            print(f"⚠️  PARALLEL PROCESSING FAILED")
-            print(f"{'='*80}")
-            print(f"Error occurred during parallel execution on cluster")
-            print(f"Error: {error_msg}")
-            print(f"{'='*80}\n")
+                    if debug:
+                        # Show per-user progress with worker and timing info
+                        size_str = format_size(result["total_size"])
+                        status_icon = "✓" if result["status"] == "success" else ("⚠" if result["status"] == "empty" else "✗")
+                        error_msg = f" - {result['error']}" if result['error'] else ""
+                        worker_info = f"[{result['worker_id']}]" if result['worker_id'] else ""
+                        duration_info = f"({result['duration_seconds']:.1f}s)" if result['duration_seconds'] > 0 else ""
+                        timing_info = f"start={result['start_time']} end={result['end_time']}" if result['start_time'] else ""
+                        source_info = f"[{result['file_source'].upper()}]" if result.get('file_source') else ""
 
-            if is_timeout:
-                print("This appears to be a timeout/session abandonment error.")
-                print("Long-running operations (>30-60 minutes) may be abandoned by the server.")
-                print("Note: With .collect(), entire batch must complete before timeout.\n")
+                        overall_progress = len(all_results) + chunk_processed_count
+                        print(f"  [{overall_progress}/{total_users}] {status_icon} {worker_info} {source_info} {result['username']}: "
+                              f"{result['file_count']} files ({size_str}) {duration_info}")
+                        if timing_info:
+                            print(f"      ↳ {timing_info}{error_msg}")
 
-            # Save partial results to checkpoint
-            if results:
+                if debug:
+                    print()  # Empty line after chunk users
+
+                # Accumulate chunk results into all results
+                all_results.extend(chunk_results)
+
+                # Save checkpoint after successful chunk completion
+                # This allows resume if subsequent chunks fail
                 try:
                     with open(checkpoint_file, 'w') as f:
                         json.dump({
-                            "total_users": len(usernames),
-                            "processed_count": processed_count,
-                            "last_completed_user": results[-1]["username"],
+                            "total_users": total_users,
+                            "processed_count": len(all_results),
+                            "chunks_completed": chunk_idx,
+                            "total_chunks": num_chunks,
+                            "last_completed_user": all_results[-1]["username"] if all_results else None,
                             "timestamp": datetime.now().isoformat(),
-                            "interrupted": True,
-                            "error": error_msg,
-                            "results": results
+                            "results": all_results
                         }, f, indent=2)
-                    print(f"💾 Progress saved to checkpoint: {checkpoint_file}")
-                    print(f"   {processed_count} users completed successfully\n")
-                except Exception as save_error:
-                    print(f"Warning: Could not save checkpoint: {save_error}\n")
+                    chunk_end_time = datetime.now()
+                    chunk_duration = chunk_end_time - chunk_start_time
+                    print(f"\n✓ Chunk {chunk_idx}/{num_chunks} completed in {chunk_duration}")
+                    print(f"✓ Checkpoint saved: {len(all_results)}/{total_users} users completed\n")
+                except Exception as checkpoint_error:
+                    if debug:
+                        print(f"⚠️  Warning: Could not save checkpoint: {checkpoint_error}\n")
 
-            # Provide recovery instructions
-            print(f"{'='*80}")
-            print(f"RECOVERY OPTIONS")
-            print(f"{'='*80}")
-            print(f"Option 1 - Resume from checkpoint (RECOMMENDED):")
-            print(f"  python databricks_user_files_simple.py \\")
-            print(f"    --users-file <your-file> \\")
-            print(f"    --profile <your-profile> \\")
-            print(f"    --cluster-id <your-cluster> \\")
-            print(f"    --resume")
-            print()
-            print(f"Option 2 - Process in smaller batches:")
-            print(f"  # Split your user file into smaller chunks (e.g., 50-100 users each)")
-            print(f"  # Then process each batch separately")
-            print()
-            print(f"Option 3 - Continue with partial results:")
-            print(f"  # The checkpoint file contains all successfully processed users")
-            print(f"  # Extract results: cat {checkpoint_file} | jq .results")
-            print(f"{'='*80}\n")
+            except Exception as collection_error:
+                # Handle timeout or other errors during parallel execution of this chunk
+                error_msg = str(collection_error)
+                is_timeout = "INVALID_HANDLE" in error_msg or "OPERATION_ABANDONED" in error_msg or "abandoned" in error_msg.lower() or "timeout" in error_msg.lower()
 
-            # Raise the error to be caught by outer exception handler
-            raise
+                print(f"\n{'='*80}")
+                print(f"⚠️  CHUNK {chunk_idx}/{num_chunks} PROCESSING FAILED")
+                print(f"{'='*80}")
+                print(f"Error occurred during parallel execution of chunk {chunk_idx}")
+                print(f"Error: {error_msg}")
+                print(f"{'='*80}\n")
 
+                if is_timeout:
+                    print("This appears to be a timeout/session abandonment error.")
+                    print("Even with chunking, this chunk took too long (>30-60 minutes).")
+                    print("Consider using a smaller --chunk-size value.\n")
+
+                # Save partial results to checkpoint (accumulate all results so far)
+                if all_results or chunk_results:
+                    # Accumulate any partial chunk results
+                    all_results.extend(chunk_results)
+                    try:
+                        with open(checkpoint_file, 'w') as f:
+                            json.dump({
+                                "total_users": total_users,
+                                "processed_count": len(all_results),
+                                "chunks_completed": chunk_idx - 1,  # Previous chunks completed
+                                "total_chunks": num_chunks,
+                                "last_completed_user": all_results[-1]["username"] if all_results else None,
+                                "timestamp": datetime.now().isoformat(),
+                                "interrupted": True,
+                                "failed_chunk": chunk_idx,
+                                "error": error_msg,
+                                "results": all_results
+                            }, f, indent=2)
+                        print(f"💾 Progress saved to checkpoint: {checkpoint_file}")
+                        print(f"   {len(all_results)}/{total_users} users completed successfully")
+                        print(f"   Chunks completed: {chunk_idx-1}/{num_chunks}\n")
+                    except Exception as save_error:
+                        print(f"Warning: Could not save checkpoint: {save_error}\n")
+
+                # Provide recovery instructions
+                print(f"{'='*80}")
+                print(f"RECOVERY OPTIONS")
+                print(f"{'='*80}")
+                print(f"Option 1 - Resume from checkpoint (RECOMMENDED):")
+                print(f"  python databricks_user_files_simple.py \\")
+                print(f"    --users-file <your-file> \\")
+                print(f"    --profile <your-profile> \\")
+                print(f"    --cluster-id <your-cluster> \\")
+                print(f"    --resume")
+                print()
+                print(f"Option 2 - Use smaller chunk size:")
+                print(f"  python databricks_user_files_simple.py \\")
+                print(f"    --users-file <your-file> \\")
+                print(f"    --profile <your-profile> \\")
+                print(f"    --cluster-id <your-cluster> \\")
+                print(f"    --chunk-size 50  # Try smaller chunks")
+                print()
+                print(f"Option 3 - Continue with partial results:")
+                print(f"  # The checkpoint file contains all successfully processed users")
+                print(f"  # Extract results: cat {checkpoint_file} | jq .results")
+                print(f"{'='*80}\n")
+
+                # Raise the error to be caught by outer exception handler
+                raise
+
+        # End of chunk loop - all chunks processed successfully
         # Calculate parallel processing duration
         parallel_end_time = datetime.now()
         parallel_duration = parallel_end_time - parallel_start_time
@@ -1950,10 +2002,16 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
         else:
             duration_str = f"{seconds}s"
 
-        print(f"Parallel processing completed in {duration_str}\n")
+        print(f"\n{'='*80}")
+        print(f"ALL CHUNKS COMPLETED SUCCESSFULLY")
+        print(f"{'='*80}")
+        print(f"Total chunks processed: {num_chunks}")
+        print(f"Total users processed: {len(all_results)}/{total_users}")
+        print(f"Total processing time: {duration_str}")
+        print(f"{'='*80}\n")
 
         # Show parallel execution summary - check work distribution
-        unique_workers = set(r.get("worker_id") for r in results if r.get("worker_id"))
+        unique_workers = set(r.get("worker_id") for r in all_results if r.get("worker_id"))
 
         if debug:
             # Detailed summary in debug mode
@@ -1963,7 +2021,7 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
                 print(f"{'='*80}")
                 print(f"✓ Work was distributed across {len(unique_workers)} different executors:")
                 for worker_id in sorted(unique_workers):
-                    worker_users = [r["username"] for r in results if r.get("worker_id") == worker_id]
+                    worker_users = [r["username"] for r in all_results if r.get("worker_id") == worker_id]
                     print(f"  • {worker_id}: processed {len(worker_users)} user(s)")
                 print(f"{'='*80}\n")
             elif unique_workers and len(unique_workers) == 1:
@@ -1989,17 +2047,17 @@ def process_multiple_users_parallel(usernames: List[str], workspace_url: str, to
 
         # Merge with previous results if resuming
         if previous_results:
-            combined_results = previous_results + results
+            combined_results = previous_results + all_results
             print(f"{'='*80}")
             print(f"RESUME SUMMARY")
             print(f"{'='*80}")
             print(f"Previous completed users: {len(previous_results)}")
-            print(f"Newly processed users: {len(results)}")
+            print(f"Newly processed users: {len(all_results)}")
             print(f"Total users processed: {len(combined_results)}")
             print(f"{'='*80}\n")
             return combined_results
 
-        return results
+        return all_results
 
     except Exception as e:
         parallel_end_time = datetime.now()
@@ -2016,7 +2074,7 @@ def process_multiple_users(usernames: List[str], workspace_url: Optional[str] = 
                           token: Optional[str] = None, cluster_id: Optional[str] = None,
                           profile: Optional[str] = None, debug: bool = False,
                           output_csv: Optional[str] = None, parallel: bool = True,
-                          resume: bool = False, dbfs_only: bool = False) -> List[Dict]:
+                          resume: bool = False, dbfs_only: bool = False, chunk_size: int = 100) -> List[Dict]:
     """
     Process multiple users and return results.
     Automatically uses parallel processing if cluster_id is provided, otherwise sequential.
@@ -2029,6 +2087,7 @@ def process_multiple_users(usernames: List[str], workspace_url: Optional[str] = 
         profile: CLI profile name
         debug: Enable debug output
         output_csv: Optional CSV output file path
+        chunk_size: Number of users per chunk in parallel mode (default: 100)
         resume: Resume from checkpoint file if available
         parallel: If True and cluster_id provided, use parallel processing (default: True)
         dbfs_only: If True, scan only DBFS (skip Workspace file system)
@@ -2058,7 +2117,8 @@ def process_multiple_users(usernames: List[str], workspace_url: Optional[str] = 
             cluster_id=cluster_id,
             debug=debug,
             resume=resume,
-            dbfs_only=dbfs_only
+            dbfs_only=dbfs_only,
+            chunk_size=chunk_size
         )
 
         # If parallel processing succeeded, skip sequential
@@ -2258,6 +2318,7 @@ Performance Note:
     parser.add_argument("--workspace-url", help="Workspace URL (overrides profile)")
     parser.add_argument("--token", help="Access token (overrides profile)")
     parser.add_argument("--cluster-id", help="Cluster ID for Spark Connect (enables PARALLEL processing)")
+    parser.add_argument("--chunk-size", type=int, default=100, help="Number of users per chunk in parallel mode (default: 100, prevents timeouts)")
     parser.add_argument("--output", "-o", help="Output CSV file path for results")
     parser.add_argument("--no-parallel", action="store_true", help="Disable parallel processing (force sequential)")
     parser.add_argument("--resume", action="store_true", help="Resume from checkpoint file if available (.checkpoint_progress.json)")
@@ -2346,7 +2407,8 @@ Performance Note:
                 output_csv=args.output,
                 parallel=not args.no_parallel,  # Enable parallel by default unless --no-parallel
                 resume=args.resume,  # Resume from checkpoint if requested
-                dbfs_only=args.dbfs_only  # Scan only DBFS if requested
+                dbfs_only=args.dbfs_only,  # Scan only DBFS if requested
+                chunk_size=args.chunk_size  # Number of users per chunk
             )
 
         # Record end time and calculate duration
